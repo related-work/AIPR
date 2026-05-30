@@ -89,3 +89,23 @@ index 1111111..2222222 100644
     )
 
     assert any(finding.rule_id == "missing_required_tests" for finding in findings)
+
+
+def test_assertion_text_change_containing_not_is_not_weakened() -> None:
+    raw = """diff --git a/tests/test_users.py b/tests/test_users.py
+index 1111111..2222222 100644
+--- a/tests/test_users.py
++++ b/tests/test_users.py
+@@ -1,3 +1,3 @@
+ def test_user_not_found():
+-    assert response.json() == {"detail": "user not found"}
++    assert response.json() == {"detail": "User not found"}
+"""
+
+    findings = run_rules(
+        [{"filename": "tests/test_users.py", "status": "modified", "patch": "..."}],
+        parse_diff(raw),
+        ReviewConfig(),
+    )
+
+    assert not any(finding.rule_id == "test_assertion_weakened" for finding in findings)
