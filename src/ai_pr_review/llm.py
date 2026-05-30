@@ -18,7 +18,7 @@ from ai_pr_review.prompts import (
     build_chunk_prompt,
     build_verify_prompt,
 )
-from ai_pr_review.schemas import ChunkAnalysis, Finding
+from ai_pr_review.schemas import ChunkAnalysis, CommentContext, Finding
 
 
 class LLMError(RuntimeError):
@@ -54,6 +54,7 @@ def analyze_chunks(
     api_mode: str = "auto",
     timeout_seconds: float = 45.0,
     max_chunks: int | None = None,
+    comment_context: CommentContext | None = None,
     enabled: bool = True,
 ) -> tuple[list[Finding], list[str]]:
     if not enabled:
@@ -83,7 +84,11 @@ def analyze_chunks(
                 pr_summary=pr_summary,
                 chunk=chunk,
                 context=context,
-                comments_summary=comments_summary,
+                comments_summary=(
+                    comment_context.as_prompt_text(chunk.path)
+                    if comment_context is not None
+                    else comments_summary
+                ),
                 api_mode=api_mode,
             )
             limitations.extend(call_limitations)

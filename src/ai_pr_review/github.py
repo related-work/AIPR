@@ -74,6 +74,9 @@ class GitHubClient:
     def list_review_comments(self, ref: PRReference) -> list[dict[str, Any]]:
         return self._paginate(f"/repos/{ref.owner}/{ref.repo}/pulls/{ref.number}/comments")
 
+    def list_pull_reviews(self, ref: PRReference) -> list[dict[str, Any]]:
+        return self._paginate(f"/repos/{ref.owner}/{ref.repo}/pulls/{ref.number}/reviews")
+
     def get_pr_diff(self, ref: PRReference) -> str:
         response = self._request(
             "GET",

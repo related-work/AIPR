@@ -111,6 +111,9 @@ def test_run_review_prioritizes_chunks_before_llm(monkeypatch) -> None:
         def list_review_comments(self, ref):
             return []
 
+        def list_pull_reviews(self, ref):
+            return []
+
         def get_pr_diff(self, ref):
             return """diff --git a/src/ui.py b/src/ui.py
 --- a/src/ui.py
@@ -156,3 +159,64 @@ diff --git a/src/app/users.py b/src/app/users.py
     assert report.chunk_debug[0].selected is True
     assert report.chunk_debug[1].path == "src/ui.py"
     assert report.chunk_debug[1].selected is False
+
+
+def test_run_review_includes_pull_reviews_in_comment_context(monkeypatch) -> None:
+    class FakeGitHub:
+        def __init__(self, token=None):
+            self.token = token
+
+        def get_pr(self, ref):
+            return {
+                "html_url": ref.html_url,
+                "title": "Fake PR",
+                "body": "",
+                "head": {"sha": "abc123"},
+            }
+
+        def list_pr_files(self, ref):
+            return []
+
+        def list_pr_commits(self, ref):
+            return []
+
+        def list_issue_comments(self, ref):
+            return [{"user": {"login": "alice"}, "body": "普通评论"}]
+
+        def list_review_comments(self, ref):
+            return [{"user": {"login": "Copilot"}, "path": "src/app.py", "body": "行内评论"}]
+
+        def list_pull_reviews(self, ref):
+            return [
+                {
+                    "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                    "state": "COMMENTED",
+                    "body": "review summary",
+                }
+            ]
+
+        def get_pr_diff(self, ref):
+            return ""
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
+
+    report = cli.run_review(
+        pr_url="https://github.com/org/repo/pull/1",
+        output_format="markdown",
+        post_comment=False,
+        fail_on=None,
+        model_profile="fast",
+        changed_only=True,
+        with_context=False,
+        no_llm=True,
+        llm_max_chunks=None,
+    )
+
+    assert report.comment_context.issue_comments == 1
+    assert report.comment_context.review_comments == 1
+    assert report.comment_context.pull_reviews == 1
+    assert report.comment_context.copilot_review_comments == 1
+    assert report.comment_context.copilot_pull_reviews == 1
