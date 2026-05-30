@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from collections.abc import Callable, Sequence
 from typing import TextIO
 
 from ai_pr_review.aggregate import aggregate_report, should_fail_ci
-from ai_pr_review.config import load_config
+from ai_pr_review.config import (
+    load_config,
+    resolve_github_token,
+    resolve_openai_api_key,
+    resolve_openai_api_mode,
+    resolve_openai_base_url,
+)
 from ai_pr_review.context import retrieve_context
 from ai_pr_review.diff_parser import build_chunks, parse_diff
 from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_pr_url
@@ -43,6 +48,7 @@ def main(
             model_profile=args.model_profile,
             changed_only=args.changed_only,
             with_context=args.with_context,
+            no_llm=args.no_llm,
         )
     except (PRUrlError, GitHubAPIError, ValueError, RuntimeError) as exc:
         print(f"错误：{exc}", file=stderr)
@@ -62,11 +68,12 @@ def run_review(
     model_profile: str,
     changed_only: bool,
     with_context: bool,
+    no_llm: bool = False,
 ) -> ReviewReport:
     config = load_config()
     effective_fail_on = fail_on or config.review.fail_on
     ref = parse_pr_url(pr_url)
-    github = GitHubClient(token=os.getenv("GITHUB_TOKEN"))
+    github = GitHubClient(token=resolve_github_token(config))
     try:
         pr = github.get_pr(ref)
         files = github.list_pr_files(ref)
@@ -93,6 +100,9 @@ def run_review(
 
         rule_findings = run_rules(files, diff_files, config)
         fast_model, strong_model = select_models(config, model_profile)
+        openai_api_key = resolve_openai_api_key(config)
+        openai_base_url = resolve_openai_base_url(config)
+        openai_api_mode = resolve_openai_api_mode(config)
         pr_summary = _pr_summary(pr, files, commits)
         llm_findings, llm_limitations = analyze_chunks(
             chunks,
@@ -100,6 +110,11 @@ def run_review(
             context=context,
             comments_summary=_comments_summary(issue_comments + review_comments),
             model=fast_model,
+            api_key=openai_api_key,
+            base_url=openai_base_url,
+            api_mode=openai_api_mode,
+            timeout_seconds=config.openai.timeout_seconds,
+            enabled=not no_llm,
         )
         limitations.extend(llm_limitations)
 
@@ -107,6 +122,11 @@ def run_review(
             [*rule_findings, *llm_findings],
             context=context,
             model=strong_model,
+            api_key=openai_api_key,
+            base_url=openai_base_url,
+            api_mode=openai_api_mode,
+            timeout_seconds=config.openai.timeout_seconds,
+            enabled=not no_llm,
         )
         limitations.extend(verify_limitations)
 
@@ -175,6 +195,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--with-context",
         action="store_true",
         help="Fetch heuristic related files for additional context",
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Skip LLM analysis and return a rules-only report",
     )
     return parser
 

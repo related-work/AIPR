@@ -1,3 +1,5 @@
+.ai-pr-review.local.yml
+
 __pycache__/
 *.py[cod]
 *$py.class

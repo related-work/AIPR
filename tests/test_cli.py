@@ -42,6 +42,7 @@ def test_cli_parses_options_renders_json_and_returns_failure_for_threshold() -> 
             "accurate",
             "--changed-only",
             "--with-context",
+            "--no-llm",
         ],
         runner=runner,
         stdout=stdout,
@@ -55,6 +56,7 @@ def test_cli_parses_options_renders_json_and_returns_failure_for_threshold() -> 
     assert runner.calls[0]["model_profile"] == "accurate"
     assert runner.calls[0]["changed_only"] is True
     assert runner.calls[0]["with_context"] is True
+    assert runner.calls[0]["no_llm"] is True
 
 
 def test_cli_requires_explicit_post_comment() -> None:

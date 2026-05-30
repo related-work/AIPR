@@ -1,0 +1,31 @@
+# Copy this file to .ai-pr-review.local.yml for local-only credentials.
+# .ai-pr-review.local.yml is ignored by git.
+
+credentials:
+  github_token: "ghp_replace_with_your_token"
+
+openai:
+  api_key: "sk_replace_with_your_key"
+  model: "gpt-5.4-mini"
+  base_url: "https://api.openai.com/v1"
+  # auto: try Responses API first, then fallback to Chat Completions.
+  # responses: only use Responses API.
+  # chat: only use Chat Completions API for OpenAI-compatible gateways.
+  api_mode: "auto"
+  timeout_seconds: 45
+
+models:
+  fast: gpt-5.4-mini
+  strong: gpt-5.5
+
+review:
+  fail_on: high
+  max_llm_chunks: 4
+  ignore_paths:
+    - "dist/**"
+    - "generated/**"
+
+rules:
+  require_tests_for:
+    - "src/payment/**"
+    - "src/api/**"
