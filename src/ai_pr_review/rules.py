@@ -122,7 +122,24 @@ def _has_weakened_assertion(removed: list[DiffLine], added: list[DiffLine]) -> b
     added_asserts = [line.content for line in added if "assert" in line.content]
     if not removed_asserts or not added_asserts:
         return False
-    return any("!=" in line or "not" in line.lower() for line in added_asserts)
+    for old in removed_asserts:
+        for new in added_asserts:
+            if _assertion_strength(new) < _assertion_strength(old):
+                return True
+    return False
+
+
+def _assertion_strength(assertion: str) -> int:
+    text = assertion.strip()
+    if re.search(r"\bassert\s+.+\s+==\s+.+", text):
+        return 3
+    if re.search(r"\bassert\s+.+\s+in\s+.+", text):
+        return 2
+    if re.search(r"\bassert\s+.+\s+!=\s+.+", text):
+        return 1
+    if re.search(r"\bassert\s+not\s+", text):
+        return 1
+    return 1
 
 
 def _scan_manifest_lock_consistency(changed_paths: list[str]) -> list[Finding]:
