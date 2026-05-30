@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 
 from ai_pr_review.render import render_json, render_markdown
-from ai_pr_review.schemas import ChunkSummary, Finding, ReviewReport, RiskOverview, ScopeItem
+from ai_pr_review.schemas import (
+    ChunkSummary,
+    CommentContext,
+    Finding,
+    ReviewReport,
+    RiskOverview,
+    ScopeItem,
+)
 
 
 def _report() -> ReviewReport:
@@ -27,6 +34,12 @@ def _report() -> ReviewReport:
                 source="rule",
             )
         ],
+        comment_context=CommentContext(
+            review_comments=6,
+            pull_reviews=1,
+            copilot_review_comments=6,
+            copilot_pull_reviews=1,
+        ),
         chunk_debug=[
             ChunkSummary(
                 path="src/auth/service.py",
@@ -54,6 +67,9 @@ def test_render_markdown_contains_required_sections() -> None:
     assert "## 文件级 Review 建议" in markdown
     assert "## 测试建议" in markdown
     assert "## 是否建议合并" in markdown
+    assert "## 评论上下文" in markdown
+    assert "行内评论：6（Copilot 6）" in markdown
+    assert "Review 总结：1（Copilot 1）" in markdown
     assert "## Chunk 调试" in markdown
     assert "auth, security_path" in markdown
     assert "## 分析限制" in markdown
@@ -66,5 +82,7 @@ def test_render_json_is_machine_readable() -> None:
     assert payload["mergeRecommendation"] == "do_not_merge"
     assert payload["riskOverview"]["blocking"] == 1
     assert payload["findings"][0]["path"] == "src/auth/service.py"
+    assert payload["commentContext"]["reviewComments"] == 6
+    assert payload["commentContext"]["copilotPullReviews"] == 1
     assert payload["chunkDebug"][0]["path"] == "src/auth/service.py"
     assert payload["chunkDebug"][0]["selected"] is True

@@ -55,6 +55,13 @@ def render_markdown(report: ReviewReport) -> str:
     lines.extend(
         [
             "",
+            "## 评论上下文",
+            "",
+            f"- 普通评论：{report.comment_context.issue_comments}（Copilot {report.comment_context.copilot_issue_comments}）",
+            f"- 行内评论：{report.comment_context.review_comments}（Copilot {report.comment_context.copilot_review_comments}）",
+            f"- Review 总结：{report.comment_context.pull_reviews}（Copilot {report.comment_context.copilot_pull_reviews}）",
+            "- 评论上下文仅作背景；阻塞问题必须有 diff 或代码上下文证据。",
+            "",
             "## 风险总览",
             "",
             f"- Critical：{risk.critical}",
@@ -126,6 +133,14 @@ def render_json(report: ReviewReport) -> str:
         },
         "scope": [item.model_dump() for item in report.scope],
         "chunkDebug": [item.model_dump() for item in report.chunk_debug],
+        "commentContext": {
+            "issueComments": report.comment_context.issue_comments,
+            "reviewComments": report.comment_context.review_comments,
+            "pullReviews": report.comment_context.pull_reviews,
+            "copilotIssueComments": report.comment_context.copilot_issue_comments,
+            "copilotReviewComments": report.comment_context.copilot_review_comments,
+            "copilotPullReviews": report.comment_context.copilot_pull_reviews,
+        },
         "riskOverview": report.risk_overview.model_dump(),
         "findings": [finding.model_dump() for finding in report.findings],
         "testSuggestions": report.test_suggestions,

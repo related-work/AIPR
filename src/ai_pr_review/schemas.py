@@ -72,6 +72,35 @@ class RiskOverview(BaseModel):
     blocking: int = 0
 
 
+class CommentContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    issue_comments: int = 0
+    review_comments: int = 0
+    pull_reviews: int = 0
+    copilot_issue_comments: int = 0
+    copilot_review_comments: int = 0
+    copilot_pull_reviews: int = 0
+    prompt_text: str = ""
+    path_prompt_texts: dict[str, str] = Field(default_factory=dict, exclude=True)
+
+    def as_prompt_text(self, path: str | None = None) -> str:
+        if path and path in self.path_prompt_texts:
+            return self.path_prompt_texts[path]
+        if self.prompt_text:
+            return self.prompt_text
+        return (
+            "已有评论上下文（仅作为背景，不能作为 finding 证据）：\n"
+            f"issue_comments={self.issue_comments}, "
+            f"review_comments={self.review_comments}, "
+            f"pull_reviews={self.pull_reviews}, "
+            f"copilot_issue_comments={self.copilot_issue_comments}, "
+            f"copilot_review_comments={self.copilot_review_comments}, "
+            f"copilot_pull_reviews={self.copilot_pull_reviews}\n"
+            "无评论正文摘要。"
+        )
+
+
 class ReviewReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -81,6 +110,7 @@ class ReviewReport(BaseModel):
     scope: list[ScopeItem] = Field(default_factory=list)
     risk_overview: RiskOverview = Field(default_factory=RiskOverview)
     findings: list[Finding] = Field(default_factory=list)
+    comment_context: CommentContext = Field(default_factory=CommentContext)
     chunk_debug: list[ChunkSummary] = Field(default_factory=list)
     test_suggestions: list[str] = Field(default_factory=list)
     merge_recommendation: MergeRecommendation

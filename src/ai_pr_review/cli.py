@@ -7,6 +7,7 @@ from typing import TextIO
 
 from ai_pr_review.aggregate import aggregate_report, should_fail_ci
 from ai_pr_review.chunk_priority import prioritize_chunks
+from ai_pr_review.comments import build_comment_context
 from ai_pr_review.config import (
     load_config,
     resolve_github_token,
@@ -85,7 +86,13 @@ def run_review(
         commits = github.list_pr_commits(ref)
         issue_comments = github.list_issue_comments(ref)
         review_comments = github.list_review_comments(ref)
+        pull_reviews = github.list_pull_reviews(ref)
         raw_diff = github.get_pr_diff(ref)
+        comment_context = build_comment_context(
+            issue_comments=issue_comments,
+            review_comments=review_comments,
+            pull_reviews=pull_reviews,
+        )
 
         diff_files = parse_diff(raw_diff)
         chunks, limitations = build_chunks(
@@ -123,13 +130,14 @@ def run_review(
             llm_chunks,
             pr_summary=pr_summary,
             context=context,
-            comments_summary=_comments_summary(issue_comments + review_comments),
+            comments_summary=comment_context.as_prompt_text(),
             model=fast_model,
             api_key=openai_api_key,
             base_url=openai_base_url,
             api_mode=openai_api_mode,
             timeout_seconds=config.openai.timeout_seconds,
             max_chunks=None,
+            comment_context=comment_context,
             enabled=not no_llm,
         )
         limitations.extend(llm_limitations)
@@ -150,9 +158,10 @@ def run_review(
             pr=pr,
             files=files,
             commits=commits,
-            comments=issue_comments + review_comments,
+            comments=issue_comments + review_comments + pull_reviews,
             findings=verified_findings,
             limitations=limitations,
+            comment_context=comment_context,
             chunk_debug=chunk_debug if debug_chunks else [],
         )
 
