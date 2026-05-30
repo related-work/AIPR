@@ -19,6 +19,7 @@ ai-pr-review https://github.com/org/repo/pull/123 --format json
 ai-pr-review https://github.com/org/repo/pull/123 --fail-on high
 ai-pr-review https://github.com/org/repo/pull/123 --with-context
 ai-pr-review https://github.com/org/repo/pull/123 --no-llm
+ai-pr-review https://github.com/org/repo/pull/123 --llm-max-chunks 2
 ai-pr-review https://github.com/org/repo/pull/123 --post-comment
 ```
 
@@ -101,6 +102,18 @@ OpenAI API mode:
 auto      Try Responses API first, then fallback to Chat Completions.
 responses Use only Responses API with structured outputs.
 chat      Use only Chat Completions, useful for OpenAI-compatible gateways.
+```
+
+Speed controls:
+
+```yaml
+review:
+  max_llm_chunks: 4
+```
+
+```bash
+ai-pr-review PR_URL --no-llm
+ai-pr-review PR_URL --llm-max-chunks 2
 ```
 
 For slow OpenAI-compatible gateways, prefer:

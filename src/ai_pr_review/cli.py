@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from typing import TextIO
 
 from ai_pr_review.aggregate import aggregate_report, should_fail_ci
+from ai_pr_review.chunk_priority import prioritize_chunks
 from ai_pr_review.config import (
     load_config,
     resolve_github_token,
@@ -49,6 +50,8 @@ def main(
             changed_only=args.changed_only,
             with_context=args.with_context,
             no_llm=args.no_llm,
+            llm_max_chunks=args.llm_max_chunks,
+            debug_chunks=args.debug_chunks,
         )
     except (PRUrlError, GitHubAPIError, ValueError, RuntimeError) as exc:
         print(f"错误：{exc}", file=stderr)
@@ -69,6 +72,8 @@ def run_review(
     changed_only: bool,
     with_context: bool,
     no_llm: bool = False,
+    llm_max_chunks: int | None = None,
+    debug_chunks: bool = False,
 ) -> ReviewReport:
     config = load_config()
     effective_fail_on = fail_on or config.review.fail_on
@@ -103,9 +108,19 @@ def run_review(
         openai_api_key = resolve_openai_api_key(config)
         openai_base_url = resolve_openai_base_url(config)
         openai_api_mode = resolve_openai_api_mode(config)
+        max_llm_chunks = (
+            llm_max_chunks
+            if llm_max_chunks is not None
+            else config.review.max_llm_chunks
+        )
+        llm_chunks, chunk_debug, chunk_limitations = prioritize_chunks(
+            chunks,
+            max_chunks=max_llm_chunks,
+        )
+        limitations.extend(chunk_limitations)
         pr_summary = _pr_summary(pr, files, commits)
         llm_findings, llm_limitations = analyze_chunks(
-            chunks,
+            llm_chunks,
             pr_summary=pr_summary,
             context=context,
             comments_summary=_comments_summary(issue_comments + review_comments),
@@ -114,6 +129,7 @@ def run_review(
             base_url=openai_base_url,
             api_mode=openai_api_mode,
             timeout_seconds=config.openai.timeout_seconds,
+            max_chunks=None,
             enabled=not no_llm,
         )
         limitations.extend(llm_limitations)
@@ -137,6 +153,7 @@ def run_review(
             comments=issue_comments + review_comments,
             findings=verified_findings,
             limitations=limitations,
+            chunk_debug=chunk_debug if debug_chunks else [],
         )
 
         if post_comment:
@@ -200,6 +217,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-llm",
         action="store_true",
         help="Skip LLM analysis and return a rules-only report",
+    )
+    parser.add_argument(
+        "--llm-max-chunks",
+        type=int,
+        default=None,
+        help="Maximum number of diff chunks to send to the LLM",
+    )
+    parser.add_argument(
+        "--debug-chunks",
+        action="store_true",
+        help="Include chunk ranking and selection details in the report",
     )
     return parser
 

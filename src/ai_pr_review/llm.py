@@ -53,6 +53,7 @@ def analyze_chunks(
     base_url: str | None = None,
     api_mode: str = "auto",
     timeout_seconds: float = 45.0,
+    max_chunks: int | None = None,
     enabled: bool = True,
 ) -> tuple[list[Finding], list[str]]:
     if not enabled:
@@ -61,14 +62,20 @@ def analyze_chunks(
     if not api_key:
         return [], ["未设置 OPENAI_API_KEY，已跳过 LLM 分析，仅输出规则引擎结果"]
 
-    findings: list[Finding] = []
+    chunk_list = list(chunks)
     limitations: list[str] = []
+    if max_chunks is not None and max_chunks >= 0 and len(chunk_list) > max_chunks:
+        skipped = len(chunk_list) - max_chunks
+        chunk_list = chunk_list[:max_chunks]
+        limitations.append(f"LLM 分析已限制为前 {max_chunks} 个 chunk，跳过 {skipped} 个 chunk")
+
+    findings: list[Finding] = []
     client = _create_client(
         api_key=api_key,
         base_url=base_url,
         timeout_seconds=timeout_seconds,
     )
-    for chunk in chunks:
+    for chunk in chunk_list:
         try:
             analysis, call_limitations = _analyze_chunk(
                 client,
