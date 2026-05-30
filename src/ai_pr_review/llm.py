@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -29,6 +30,18 @@ class LLMError(RuntimeError):
 class LLMCallResult:
     payload: dict
     limitations: list[str] = field(default_factory=list)
+
+
+COMMENT_DERIVED_MARKERS = (
+    "已有评论",
+    "评论摘要",
+    "根据评论",
+    "评论中",
+    "copilot",
+    "review comment",
+    "issue comment",
+    "comment summary",
+)
 
 
 def select_models(config: ReviewConfig, profile: str) -> tuple[str, str]:
@@ -71,6 +84,8 @@ def analyze_chunks(
         limitations.append(f"LLM 分析已限制为前 {max_chunks} 个 chunk，跳过 {skipped} 个 chunk")
 
     findings: list[Finding] = []
+    dropped_path_findings = 0
+    dropped_comment_findings = 0
     client = _create_client(
         api_key=api_key,
         base_url=base_url,
@@ -95,10 +110,23 @@ def analyze_chunks(
         except LLMError as exc:
             limitations.append(str(exc))
             continue
+        kept_findings = []
+        for finding in analysis.findings:
+            if finding.path != chunk.path:
+                dropped_path_findings += 1
+                continue
+            if _is_comment_derived_finding(finding):
+                dropped_comment_findings += 1
+                continue
+            kept_findings.append(finding)
         findings.extend(
             finding.model_copy(update={"source": "llm", "rule_id": None})
-            for finding in analysis.findings
+            for finding in kept_findings
         )
+    if dropped_path_findings:
+        limitations.append(f"已丢弃 {dropped_path_findings} 条非当前文件 finding")
+    if dropped_comment_findings:
+        limitations.append(f"已丢弃 {dropped_comment_findings} 条仅由已有评论支撑的 finding")
     return findings, limitations
 
 
@@ -371,6 +399,17 @@ def _parse_json_object(text: str) -> dict:
         return json.loads(stripped)
     except json.JSONDecodeError as exc:
         raise LLMError("LLM 返回了非 JSON 内容") from exc
+
+
+def _is_comment_derived_finding(finding: Finding) -> bool:
+    combined = " ".join([*finding.evidence, finding.problem, finding.suggestion]).lower()
+    if not any(marker.lower() in combined for marker in COMMENT_DERIVED_MARKERS):
+        return False
+    code_like = any(
+        re.search(r"(^|\s)[+-]\s*\S+", item) or "`" in item or "diff" in item.lower()
+        for item in finding.evidence
+    )
+    return not code_like
 
 
 def _local_verify(findings: list[Finding]) -> list[Finding]:

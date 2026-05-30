@@ -17,6 +17,7 @@ from ai_pr_review.config import (
 )
 from ai_pr_review.context import retrieve_context
 from ai_pr_review.diff_parser import build_chunks, parse_diff
+from ai_pr_review.evidence import verify_finding_evidence
 from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_pr_url
 from ai_pr_review.llm import analyze_chunks, select_models, verify_high_risk_findings
 from ai_pr_review.render import render_json, render_markdown
@@ -153,13 +154,19 @@ def run_review(
             enabled=not no_llm,
         )
         limitations.extend(verify_limitations)
+        evidence_findings, evidence_limitations = verify_finding_evidence(
+            verified_findings,
+            diff_files=diff_files,
+            context=context,
+        )
+        limitations.extend(evidence_limitations)
 
         report = aggregate_report(
             pr=pr,
             files=files,
             commits=commits,
             comments=issue_comments + review_comments + pull_reviews,
-            findings=verified_findings,
+            findings=evidence_findings,
             limitations=limitations,
             comment_context=comment_context,
             chunk_debug=chunk_debug if debug_chunks else [],
