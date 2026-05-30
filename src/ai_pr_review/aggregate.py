@@ -22,7 +22,12 @@ def aggregate_report(
     comment_context: CommentContext | None = None,
     chunk_debug: list[ChunkSummary] | None = None,
 ) -> ReviewReport:
-    filtered = [_calibrate_blocking(finding) for finding in findings if finding.evidence]
+    changed_paths = {str(file.get("filename") or "") for file in files}
+    filtered = [
+        _calibrate_blocking(finding)
+        for finding in findings
+        if finding.evidence and _is_supported_path(finding, changed_paths)
+    ]
     deduped = _dedupe_findings(filtered)
     sorted_findings = sorted(
         deduped,
@@ -50,6 +55,12 @@ def aggregate_report(
         limitations=_unique(limitations),
     )
     return report
+
+
+def _is_supported_path(finding: Finding, changed_paths: set[str]) -> bool:
+    if finding.source != "llm":
+        return True
+    return finding.path in changed_paths
 
 
 def should_fail_ci(report: ReviewReport, fail_on: str | None) -> bool:

@@ -91,3 +91,41 @@ def test_aggregate_allows_merge_with_non_blocking_suggestions() -> None:
 
     assert report.merge_recommendation == "merge_with_suggestions"
     assert should_fail_ci(report, "low") is False
+
+
+def test_aggregate_drops_llm_findings_outside_changed_files() -> None:
+    report = aggregate_report(
+        pr={"html_url": "https://github.com/org/repo/pull/3", "title": "Change app", "body": ""},
+        files=[{"filename": "src/app.py", "additions": 1, "deletions": 0}],
+        commits=[],
+        comments=[],
+        findings=[
+            Finding(
+                path="tests/ (推测)",
+                line=None,
+                severity="medium",
+                category="test",
+                confidence=0.8,
+                evidence=["PR 描述"],
+                problem="模型推测的非变更路径",
+                suggestion="补测试",
+                blocking=False,
+                source="llm",
+            ),
+            Finding(
+                path="src/app.py",
+                line=None,
+                severity="low",
+                category="maintainability",
+                confidence=0.7,
+                evidence=["+return value"],
+                problem="当前文件建议",
+                suggestion="调整当前文件",
+                blocking=False,
+                source="llm",
+            ),
+        ],
+        limitations=[],
+    )
+
+    assert [finding.path for finding in report.findings] == ["src/app.py"]

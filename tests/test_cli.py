@@ -4,7 +4,7 @@ import io
 import json
 
 from ai_pr_review import cli
-from ai_pr_review.schemas import ReviewReport, RiskOverview
+from ai_pr_review.schemas import Finding, ReviewReport, RiskOverview
 
 
 class FakeRunner:
@@ -220,3 +220,83 @@ def test_run_review_includes_pull_reviews_in_comment_context(monkeypatch) -> Non
     assert report.comment_context.pull_reviews == 1
     assert report.comment_context.copilot_review_comments == 1
     assert report.comment_context.copilot_pull_reviews == 1
+
+
+def test_run_review_applies_evidence_verifier_to_llm_findings(monkeypatch) -> None:
+    class FakeGitHub:
+        def __init__(self, token=None):
+            self.token = token
+
+        def get_pr(self, ref):
+            return {
+                "html_url": ref.html_url,
+                "title": "Fake PR",
+                "body": "",
+                "head": {"sha": "abc123"},
+            }
+
+        def list_pr_files(self, ref):
+            return [
+                {
+                    "filename": "src/app.py",
+                    "additions": 1,
+                    "deletions": 1,
+                    "patch": "@@ -1 +1 @@\n-return 0\n+return 1",
+                }
+            ]
+
+        def list_pr_commits(self, ref):
+            return []
+
+        def list_issue_comments(self, ref):
+            return []
+
+        def list_review_comments(self, ref):
+            return []
+
+        def list_pull_reviews(self, ref):
+            return []
+
+        def get_pr_diff(self, ref):
+            return """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1 @@
+-return 0
++return 1
+"""
+
+        def close(self):
+            pass
+
+    unsupported = Finding(
+        path="src/app.py",
+        line=1,
+        severity="high",
+        category="logic",
+        confidence=0.9,
+        evidence=["Copilot 评论说这里有问题"],
+        problem="仅由评论支撑的问题",
+        suggestion="按评论修改",
+        blocking=True,
+        source="llm",
+    )
+
+    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
+    monkeypatch.setattr(cli, "analyze_chunks", lambda *_, **__: ([unsupported], []))
+    monkeypatch.setattr(cli, "verify_high_risk_findings", lambda findings, **__: (findings, []))
+
+    report = cli.run_review(
+        pr_url="https://github.com/org/repo/pull/1",
+        output_format="markdown",
+        post_comment=False,
+        fail_on=None,
+        model_profile="fast",
+        changed_only=True,
+        with_context=False,
+        no_llm=False,
+        llm_max_chunks=None,
+    )
+
+    assert report.findings == []
+    assert "已丢弃 1 条缺少 diff 或上下文代码证据的 LLM finding" in report.limitations
