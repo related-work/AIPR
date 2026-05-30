@@ -51,6 +51,17 @@ class ScopeItem(BaseModel):
     description: str
 
 
+class ChunkSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    old_start: int | None = None
+    new_start: int | None = None
+    score: int = 0
+    reasons: list[str] = Field(default_factory=list)
+    selected: bool = False
+
+
 class RiskOverview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -70,6 +81,7 @@ class ReviewReport(BaseModel):
     scope: list[ScopeItem] = Field(default_factory=list)
     risk_overview: RiskOverview = Field(default_factory=RiskOverview)
     findings: list[Finding] = Field(default_factory=list)
+    chunk_debug: list[ChunkSummary] = Field(default_factory=list)
     test_suggestions: list[str] = Field(default_factory=list)
     merge_recommendation: MergeRecommendation
     limitations: list[str] = Field(default_factory=list)

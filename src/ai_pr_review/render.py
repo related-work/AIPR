@@ -34,6 +34,23 @@ def render_markdown(report: ReviewReport) -> str:
     else:
         lines.append("| 无 | 0 | 未识别到文件变更 |")
 
+    if report.chunk_debug:
+        lines.extend(
+            [
+                "",
+                "## Chunk 调试",
+                "",
+                "| 选择 | 分数 | 位置 | 原因 |",
+                "|---|---:|---|---|",
+            ]
+        )
+        for item in report.chunk_debug:
+            location = item.path if item.new_start is None else f"{item.path}:{item.new_start}"
+            lines.append(
+                f"| {'是' if item.selected else '否'} | {item.score} | "
+                f"{location} | {_escape_table(', '.join(item.reasons))} |"
+            )
+
     risk = report.risk_overview
     lines.extend(
         [
@@ -108,6 +125,7 @@ def render_json(report: ReviewReport) -> str:
             "summary": report.summary,
         },
         "scope": [item.model_dump() for item in report.scope],
+        "chunkDebug": [item.model_dump() for item in report.chunk_debug],
         "riskOverview": report.risk_overview.model_dump(),
         "findings": [finding.model_dump() for finding in report.findings],
         "testSuggestions": report.test_suggestions,

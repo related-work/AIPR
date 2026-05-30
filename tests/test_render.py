@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from ai_pr_review.render import render_json, render_markdown
-from ai_pr_review.schemas import Finding, ReviewReport, RiskOverview, ScopeItem
+from ai_pr_review.schemas import ChunkSummary, Finding, ReviewReport, RiskOverview, ScopeItem
 
 
 def _report() -> ReviewReport:
@@ -27,6 +27,16 @@ def _report() -> ReviewReport:
                 source="rule",
             )
         ],
+        chunk_debug=[
+            ChunkSummary(
+                path="src/auth/service.py",
+                old_start=10,
+                new_start=12,
+                score=80,
+                reasons=["auth", "security_path"],
+                selected=True,
+            ),
+        ],
         test_suggestions=["增加无权限访问测试"],
         merge_recommendation="do_not_merge",
         limitations=["未运行测试套件"],
@@ -44,6 +54,8 @@ def test_render_markdown_contains_required_sections() -> None:
     assert "## 文件级 Review 建议" in markdown
     assert "## 测试建议" in markdown
     assert "## 是否建议合并" in markdown
+    assert "## Chunk 调试" in markdown
+    assert "auth, security_path" in markdown
     assert "## 分析限制" in markdown
     assert "src/auth/service.py:12" in markdown
 
@@ -54,3 +66,5 @@ def test_render_json_is_machine_readable() -> None:
     assert payload["mergeRecommendation"] == "do_not_merge"
     assert payload["riskOverview"]["blocking"] == 1
     assert payload["findings"][0]["path"] == "src/auth/service.py"
+    assert payload["chunkDebug"][0]["path"] == "src/auth/service.py"
+    assert payload["chunkDebug"][0]["selected"] is True

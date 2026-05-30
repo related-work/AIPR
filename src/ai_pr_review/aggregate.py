@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from pathlib import PurePosixPath
 from typing import Any
 
-from ai_pr_review.schemas import Finding, ReviewReport, RiskOverview, ScopeItem
+from ai_pr_review.schemas import ChunkSummary, Finding, ReviewReport, RiskOverview, ScopeItem
 
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
@@ -18,6 +18,7 @@ def aggregate_report(
     comments: list[dict[str, Any]],
     findings: list[Finding],
     limitations: list[str],
+    chunk_debug: list[ChunkSummary] | None = None,
 ) -> ReviewReport:
     filtered = [_calibrate_blocking(finding) for finding in findings if finding.evidence]
     deduped = _dedupe_findings(filtered)
@@ -40,6 +41,7 @@ def aggregate_report(
         scope=_scope(files),
         risk_overview=risk,
         findings=sorted_findings,
+        chunk_debug=chunk_debug or [],
         test_suggestions=_test_suggestions(sorted_findings),
         merge_recommendation=_merge_recommendation(sorted_findings),
         limitations=_unique(limitations),
