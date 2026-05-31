@@ -44,6 +44,12 @@ openai:
   timeout_seconds: 12.5
 review:
   max_llm_chunks: 3
+  max_files: 40
+  max_chunks: 12
+  max_context_files: 8
+  max_patch_lines_per_chunk: 250
+  large_pr_file_threshold: 20
+  large_pr_line_threshold: 1500
 """,
         encoding="utf-8",
     )
@@ -62,6 +68,12 @@ review:
     assert config.review.fail_on == "high"
     assert config.review.ignore_paths == ["dist/**"]
     assert config.review.max_llm_chunks == 3
+    assert config.review.max_files == 40
+    assert config.review.max_chunks == 12
+    assert config.review.max_context_files == 8
+    assert config.review.max_patch_lines_per_chunk == 250
+    assert config.review.large_pr_file_threshold == 20
+    assert config.review.large_pr_line_threshold == 1500
     assert config.rules.require_tests_for == ["src/payment/**"]
 
 

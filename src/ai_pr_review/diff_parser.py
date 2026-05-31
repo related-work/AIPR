@@ -309,6 +309,7 @@ def build_chunks(
     *,
     changed_only: bool = False,
     ignore_paths: list[str] | None = None,
+    max_patch_lines_per_chunk: int | None = None,
 ) -> tuple[list[DiffChunk], list[str]]:
     ignore_paths = ignore_paths or []
     github_by_path = {str(file.get("filename")): file for file in github_files}
@@ -340,16 +341,48 @@ def build_chunks(
         if diff_file is None:
             continue
         for hunk in diff_file.hunks:
-            chunks.append(
-                DiffChunk(
-                    path=path,
-                    patch="\n".join([hunk.section_header, hunk.patch]).strip(),
-                    old_start=hunk.old_start,
-                    new_start=hunk.new_start,
-                    old_length=hunk.old_length,
-                    new_length=hunk.new_length,
-                    classification=classification,
+            for split in _split_hunk(hunk, max_patch_lines_per_chunk):
+                chunks.append(
+                    DiffChunk(
+                        path=path,
+                        patch=split["patch"],
+                        old_start=split["old_start"],
+                        new_start=split["new_start"],
+                        old_length=split["old_length"],
+                        new_length=split["new_length"],
+                        classification=classification,
+                    )
                 )
-            )
 
     return chunks, limitations
+
+
+def _split_hunk(hunk: DiffHunk, max_patch_lines: int | None) -> list[dict[str, int | str | None]]:
+    if max_patch_lines is None or max_patch_lines <= 0 or len(hunk.lines) <= max_patch_lines:
+        return [
+            {
+                "patch": "\n".join([hunk.section_header, hunk.patch]).strip(),
+                "old_start": hunk.old_start,
+                "new_start": hunk.new_start,
+                "old_length": hunk.old_length,
+                "new_length": hunk.new_length,
+            }
+        ]
+
+    chunks: list[dict[str, int | str | None]] = []
+    for index in range(0, len(hunk.lines), max_patch_lines):
+        lines = hunk.lines[index : index + max_patch_lines]
+        old_numbers = [line.old_line_no for line in lines if line.old_line_no is not None]
+        new_numbers = [line.new_line_no for line in lines if line.new_line_no is not None]
+        chunks.append(
+            {
+                "patch": "\n".join(
+                    [hunk.section_header, *[line.content for line in lines]]
+                ).strip(),
+                "old_start": old_numbers[0] if old_numbers else None,
+                "new_start": new_numbers[0] if new_numbers else None,
+                "old_length": len(old_numbers),
+                "new_length": len(new_numbers),
+            }
+        )
+    return chunks

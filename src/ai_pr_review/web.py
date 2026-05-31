@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import UTC, date, datetime
 from http import HTTPStatus
@@ -36,6 +37,8 @@ from ai_pr_review.schemas import Finding
 
 
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
+BatchItemStatus = Literal["pending", "running", "succeeded", "failed", "skipped"]
+RiskLevel = Literal["critical", "high", "medium", "low", "unknown"]
 Executor = Callable[[list[str], Path, dict[str, str]], subprocess.CompletedProcess[str]]
 OWNER_REPO_PATTERN = r"^[A-Za-z0-9_.-]+$"
 
@@ -59,6 +62,15 @@ class ReviewRunRequest(BaseModel):
     with_context: bool = Field(default=False, alias="withContext")
     no_llm: bool = Field(default=False, alias="noLlm")
     llm_max_chunks: int | None = Field(default=None, ge=1, le=50, alias="llmMaxChunks")
+    max_files: int | None = Field(default=None, ge=1, le=500, alias="maxFiles")
+    max_chunks: int | None = Field(default=None, ge=1, le=1000, alias="maxChunks")
+    max_context_files: int | None = Field(default=None, ge=1, le=200, alias="maxContextFiles")
+    max_patch_lines_per_chunk: int | None = Field(
+        default=None,
+        ge=20,
+        le=2000,
+        alias="maxPatchLinesPerChunk",
+    )
     debug_chunks: bool = Field(default=False, alias="debugChunks")
 
     @field_validator("pr_url")
@@ -88,6 +100,42 @@ class ReviewJob(BaseModel):
     progress: list[ProgressEvent] = Field(default_factory=list)
 
 
+class BatchReviewRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    requests: list[ReviewRunRequest] = Field(min_length=1, max_length=50)
+
+
+class BatchReviewItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    pr_url: str = Field(alias="prUrl")
+    title: str = ""
+    number: int | None = None
+    job_id: str | None = Field(default=None, alias="jobId")
+    status: BatchItemStatus = "pending"
+    risk: RiskLevel = "unknown"
+    merge_recommendation: str | None = Field(default=None, alias="mergeRecommendation")
+    blocking_findings: int = Field(default=0, alias="blockingFindings")
+    coverage_ratio: float | None = Field(default=None, alias="coverageRatio")
+    error: str | None = None
+
+
+class BatchReviewJob(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    status: JobStatus
+    created_at: str = Field(alias="createdAt")
+    started_at: str | None = Field(default=None, alias="startedAt")
+    finished_at: str | None = Field(default=None, alias="finishedAt")
+    total: int
+    completed: int = 0
+    failed: int = 0
+    items: list[BatchReviewItem]
+
+
 def build_cli_args(request: ReviewRunRequest) -> list[str]:
     args = [
         request.pr_url,
@@ -110,6 +158,14 @@ def build_cli_args(request: ReviewRunRequest) -> list[str]:
         args.append("--no-llm")
     if request.llm_max_chunks is not None:
         args.extend(["--llm-max-chunks", str(request.llm_max_chunks)])
+    if request.max_files is not None:
+        args.extend(["--max-files", str(request.max_files)])
+    if request.max_chunks is not None:
+        args.extend(["--max-chunks", str(request.max_chunks)])
+    if request.max_context_files is not None:
+        args.extend(["--max-context-files", str(request.max_context_files)])
+    if request.max_patch_lines_per_chunk is not None:
+        args.extend(["--max-patch-lines-per-chunk", str(request.max_patch_lines_per_chunk)])
     if request.debug_chunks:
         args.append("--debug-chunks")
     return args
@@ -603,9 +659,118 @@ class ReviewJobStore:
                 self._persist_locked(job)
 
 
+class BatchReviewStore:
+    def __init__(
+        self,
+        *,
+        review_store: ReviewJobStore,
+        poll_interval: float = 0.25,
+        max_batches: int = 20,
+    ) -> None:
+        self._review_store = review_store
+        self._poll_interval = poll_interval
+        self._max_batches = max_batches
+        self._batches: dict[str, BatchReviewJob] = {}
+        self._order: list[str] = []
+        self._requests: dict[str, list[ReviewRunRequest]] = {}
+        self._lock = threading.Lock()
+
+    def start(self, request: BatchReviewRunRequest) -> BatchReviewJob:
+        created_at = _now()
+        batch_id = uuid.uuid4().hex
+        items = [
+            BatchReviewItem(
+                id=uuid.uuid4().hex,
+                prUrl=review_request.pr_url,
+                number=_pull_number(review_request.pr_url),
+            )
+            for review_request in request.requests
+        ]
+        batch = BatchReviewJob(
+            id=batch_id,
+            status="queued",
+            createdAt=created_at,
+            total=len(items),
+            items=items,
+        )
+        with self._lock:
+            self._batches[batch.id] = batch
+            self._requests[batch.id] = list(request.requests)
+            self._order.append(batch.id)
+            self._trim_locked()
+        thread = threading.Thread(target=self._run, args=(batch.id,), daemon=True)
+        thread.start()
+        return self.get(batch.id)
+
+    def get(self, batch_id: str) -> BatchReviewJob:
+        with self._lock:
+            return self._batches[batch_id].model_copy(deep=True)
+
+    def list_recent(self) -> list[dict]:
+        with self._lock:
+            batches = [self._batches[batch_id].model_copy(deep=True) for batch_id in reversed(self._order)]
+        return [_batch_payload(batch) for batch in batches]
+
+    def _run(self, batch_id: str) -> None:
+        with self._lock:
+            batch = self._batches[batch_id]
+            batch.status = "running"
+            batch.started_at = _now()
+            requests = list(self._requests[batch_id])
+
+        for index, request in enumerate(requests):
+            batch = self.get(batch_id)
+            if batch.status not in {"queued", "running"}:
+                return
+            item = batch.items[index]
+            self._update_item(batch_id, index, item.model_copy(update={"status": "running"}))
+            safe_request = _batch_safe_request(request)
+            job = self._review_store.start(safe_request)
+            self._update_item(batch_id, index, item.model_copy(update={"status": "running", "job_id": job.id}))
+
+            while True:
+                current = self._review_store.get(job.id)
+                if current.status not in {"queued", "running"}:
+                    break
+                time.sleep(self._poll_interval)
+
+            self._update_item(batch_id, index, _item_from_review_job(item, current))
+
+        with self._lock:
+            batch = self._batches[batch_id]
+            failed = sum(1 for item in batch.items if item.status == "failed")
+            completed = sum(1 for item in batch.items if item.status in {"succeeded", "failed", "skipped"})
+            batch.failed = failed
+            batch.completed = completed
+            batch.status = "failed" if failed else "succeeded"
+            batch.finished_at = _now()
+
+    def _update_item(self, batch_id: str, index: int, item: BatchReviewItem) -> None:
+        with self._lock:
+            batch = self._batches[batch_id]
+            items = list(batch.items)
+            items[index] = item
+            completed = sum(1 for current in items if current.status in {"succeeded", "failed", "skipped"})
+            failed = sum(1 for current in items if current.status == "failed")
+            self._batches[batch_id] = batch.model_copy(
+                update={
+                    "items": items,
+                    "completed": completed,
+                    "failed": failed,
+                }
+            )
+
+    def _trim_locked(self) -> None:
+        while len(self._order) > self._max_batches:
+            batch_id = self._order.pop(0)
+            self._batches.pop(batch_id, None)
+            self._requests.pop(batch_id, None)
+
+
 def create_handler(
     *,
     store: ReviewJobStore,
+    batch_store: BatchReviewStore,
     quality_store: QualitySnapshotStore,
     frontend_dir: Path,
 ) -> type[BaseHTTPRequestHandler]:
@@ -638,6 +803,18 @@ def create_handler(
                 return
             if path == "/api/reviews":
                 self._handle_review_list()
+                return
+            if path == "/api/batches":
+                self._send_json({"batches": batch_store.list_recent()})
+                return
+            if path.startswith("/api/batches/"):
+                batch_id = path.rsplit("/", 1)[-1]
+                try:
+                    batch = batch_store.get(batch_id)
+                except KeyError:
+                    self._send_json({"error": "batch job not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(_batch_payload(batch))
                 return
             if path.startswith("/api/reviews/") and path.endswith("/export"):
                 self._handle_review_export(path)
@@ -676,6 +853,9 @@ def create_handler(
             if path == "/api/quality-evaluation/snapshots":
                 self._handle_quality_snapshot_save()
                 return
+            if path == "/api/batches":
+                self._handle_batch_start()
+                return
             if path != "/api/reviews":
                 self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -692,6 +872,19 @@ def create_handler(
 
             job = store.start(request)
             self._send_json(_job_payload(job), status=HTTPStatus.ACCEPTED)
+
+        def _handle_batch_start(self) -> None:
+            try:
+                payload = self._read_json()
+                request = BatchReviewRunRequest.model_validate(payload)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except ValidationError as exc:
+                self._send_json({"error": "invalid batch request", "details": exc.errors()}, status=422)
+                return
+            batch = batch_store.start(request)
+            self._send_json(_batch_payload(batch), status=HTTPStatus.ACCEPTED)
 
         def do_DELETE(self) -> None:
             path = urlparse(self.path).path
@@ -979,8 +1172,14 @@ def run_web_server(
     root = Path(__file__).resolve().parents[2]
     static_dir = Path(frontend_dir) if frontend_dir else root / "frontend" / "dist"
     store = ReviewJobStore(cwd=root, storage_dir=root / ".ai-pr-review" / "runs")
+    batch_store = BatchReviewStore(review_store=store)
     quality_store = QualitySnapshotStore(root / ".ai-pr-review" / "quality-eval")
-    handler = create_handler(store=store, quality_store=quality_store, frontend_dir=static_dir)
+    handler = create_handler(
+        store=store,
+        batch_store=batch_store,
+        quality_store=quality_store,
+        frontend_dir=static_dir,
+    )
     server = ThreadingHTTPServer((host, port), handler)
     print(f"AI PR Review Web 正在运行：http://{host}:{port}")
     print("按 Ctrl+C 停止。")
@@ -995,6 +1194,85 @@ def run_web_server(
 
 def _job_payload(job: ReviewJob) -> dict:
     return job.model_dump(by_alias=True)
+
+
+def _batch_payload(batch: BatchReviewJob) -> dict:
+    return batch.model_dump(by_alias=True)
+
+
+def _batch_safe_request(request: ReviewRunRequest) -> ReviewRunRequest:
+    return request.model_copy(
+        update={
+            "output_format": "json",
+            "post_comment": False,
+            "post_inline_comments": False,
+        }
+    )
+
+
+def _item_from_review_job(item: BatchReviewItem, job: ReviewJob) -> BatchReviewItem:
+    if job.status != "succeeded":
+        error = job.stderr.strip() or job.error or f"exit {job.exit_code}"
+        return item.model_copy(
+            update={
+                "job_id": job.id,
+                "status": "failed",
+                "error": error,
+            }
+        )
+    summary = _review_output_summary(job.stdout)
+    return item.model_copy(
+        update={
+            "job_id": job.id,
+            "status": "succeeded",
+            "risk": summary["risk"],
+            "merge_recommendation": summary["mergeRecommendation"],
+            "blocking_findings": summary["blockingFindings"],
+            "coverage_ratio": summary["coverageRatio"],
+            "error": None,
+        }
+    )
+
+
+def _review_output_summary(output: str) -> dict:
+    try:
+        payload = json.loads(output)
+    except ValueError:
+        return {
+            "risk": "unknown",
+            "mergeRecommendation": None,
+            "blockingFindings": 0,
+            "coverageRatio": None,
+        }
+    if not isinstance(payload, dict):
+        return {
+            "risk": "unknown",
+            "mergeRecommendation": None,
+            "blockingFindings": 0,
+            "coverageRatio": None,
+        }
+    risk_overview = payload.get("riskOverview") if isinstance(payload.get("riskOverview"), dict) else {}
+    coverage = payload.get("analysisCoverage") if isinstance(payload.get("analysisCoverage"), dict) else {}
+    return {
+        "risk": _risk_level(risk_overview),
+        "mergeRecommendation": payload.get("mergeRecommendation"),
+        "blockingFindings": int(risk_overview.get("blocking") or 0),
+        "coverageRatio": coverage.get("coverageRatio"),
+    }
+
+
+def _risk_level(risk_overview: dict) -> RiskLevel:
+    for level in ("critical", "high", "medium", "low"):
+        if int(risk_overview.get(level) or 0) > 0:
+            return level
+    return "low"
+
+
+def _pull_number(pr_url: str) -> int | None:
+    try:
+        return parse_pr_url(pr_url).number
+    except PRUrlError:
+        return None
 
 
 def _progress_key(event: ProgressEvent) -> tuple[str, str, str, str, str | None]:

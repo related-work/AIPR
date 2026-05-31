@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from ai_pr_review.schemas import (
+    AnalysisCoverage,
     ChunkSummary,
     CommentContext,
     Finding,
@@ -28,6 +29,7 @@ def aggregate_report(
     limitations: list[str],
     comment_context: CommentContext | None = None,
     chunk_debug: list[ChunkSummary] | None = None,
+    analysis_coverage: AnalysisCoverage | None = None,
 ) -> ReviewReport:
     changed_paths = {str(file.get("filename") or "") for file in files}
     filtered = [
@@ -48,6 +50,7 @@ def aggregate_report(
     )
     risk = _risk_overview(sorted_findings)
     summary = _summary(pr, files, commits)
+    coverage = analysis_coverage or AnalysisCoverage()
     report = ReviewReport(
         pr_url=str(pr.get("html_url") or ""),
         title=str(pr.get("title") or ""),
@@ -57,9 +60,10 @@ def aggregate_report(
         findings=sorted_findings,
         comment_context=comment_context or CommentContext(),
         chunk_debug=chunk_debug or [],
+        analysis_coverage=coverage,
         test_suggestions=_test_suggestions(sorted_findings),
-        merge_recommendation=_merge_recommendation(sorted_findings),
-        limitations=_unique(limitations),
+        merge_recommendation=_merge_recommendation(sorted_findings, coverage),
+        limitations=_unique([*limitations, *_coverage_limitations(coverage, sorted_findings)]),
     )
     return report
 
@@ -333,12 +337,30 @@ def _test_suggestions(findings: list[Finding]) -> list[str]:
     return _unique(suggestions)
 
 
-def _merge_recommendation(findings: list[Finding]) -> str:
+def _merge_recommendation(
+    findings: list[Finding],
+    coverage: AnalysisCoverage | None = None,
+) -> str:
     if any(finding.blocking for finding in findings):
         return "do_not_merge"
     if findings:
         return "merge_with_suggestions"
+    if coverage and coverage.large_pr and coverage.coverage_ratio < 0.5:
+        return "merge_with_suggestions"
     return "merge"
+
+
+def _coverage_limitations(
+    coverage: AnalysisCoverage,
+    findings: list[Finding],
+) -> list[str]:
+    if findings:
+        return []
+    if coverage.large_pr and coverage.coverage_ratio < 0.5:
+        return [
+            "大 PR 深度分析覆盖率较低，未发现风险不等于完整确认安全，建议人工复查未深度分析文件"
+        ]
+    return []
 
 
 def _unique(items: list[str]) -> list[str]:

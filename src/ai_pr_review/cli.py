@@ -6,7 +6,11 @@ from collections.abc import Callable, Sequence
 from typing import TextIO
 
 from ai_pr_review.aggregate import aggregate_report, should_fail_ci
-from ai_pr_review.chunk_priority import prioritize_chunks
+from ai_pr_review.chunk_budget import (
+    apply_chunk_budget,
+    build_analysis_coverage,
+    budget_from_settings,
+)
 from ai_pr_review.comments import build_comment_context
 from ai_pr_review.config import (
     load_config,
@@ -97,6 +101,10 @@ def main(
             with_context=args.with_context,
             no_llm=args.no_llm,
             llm_max_chunks=args.llm_max_chunks,
+            max_files=args.max_files,
+            max_chunks=args.max_chunks,
+            max_context_files=args.max_context_files,
+            max_patch_lines_per_chunk=args.max_patch_lines_per_chunk,
             debug_chunks=args.debug_chunks,
         )
     except (PRUrlError, GitHubAPIError, ValueError, RuntimeError) as exc:
@@ -235,6 +243,10 @@ def run_review(
     with_context: bool,
     no_llm: bool = False,
     llm_max_chunks: int | None = None,
+    max_files: int | None = None,
+    max_chunks: int | None = None,
+    max_context_files: int | None = None,
+    max_patch_lines_per_chunk: int | None = None,
     debug_chunks: bool = False,
 ) -> ReviewReport:
     progress = ProgressReporter.from_env()
@@ -266,6 +278,11 @@ def run_review(
             files,
             changed_only=changed_only,
             ignore_paths=config.review.ignore_paths,
+            max_patch_lines_per_chunk=(
+                max_patch_lines_per_chunk
+                if max_patch_lines_per_chunk is not None
+                else config.review.max_patch_lines_per_chunk
+            ),
         )
         progress.emit(
             "diff_parse",
@@ -282,6 +299,11 @@ def run_review(
             pr,
             chunks,
             enabled=with_context and not changed_only,
+            max_files=(
+                max_context_files
+                if max_context_files is not None
+                else config.review.max_context_files
+            ),
         )
         limitations.extend(context.limitations)
         progress.emit(
@@ -303,11 +325,45 @@ def run_review(
             if llm_max_chunks is not None
             else config.review.max_llm_chunks
         )
-        llm_chunks, chunk_debug, chunk_limitations = prioritize_chunks(
-            chunks,
-            max_chunks=max_llm_chunks,
+        budget = budget_from_settings(
+            max_files=max_files if max_files is not None else config.review.max_files,
+            max_chunks=max_chunks if max_chunks is not None else config.review.max_chunks,
+            max_llm_chunks=max_llm_chunks,
+            max_context_files=(
+                max_context_files
+                if max_context_files is not None
+                else config.review.max_context_files
+            ),
+            max_patch_lines_per_chunk=(
+                max_patch_lines_per_chunk
+                if max_patch_lines_per_chunk is not None
+                else config.review.max_patch_lines_per_chunk
+            ),
+            large_pr_file_threshold=config.review.large_pr_file_threshold,
+            large_pr_line_threshold=config.review.large_pr_line_threshold,
         )
-        limitations.extend(chunk_limitations)
+        chunk_selection = apply_chunk_budget(
+            chunks,
+            budget=budget,
+        )
+        llm_chunks = [] if no_llm else chunk_selection.llm_chunks
+        chunk_debug = (
+            [item.model_copy(update={"selected": False}) for item in chunk_selection.chunk_debug]
+            if no_llm
+            else chunk_selection.chunk_debug
+        )
+        analysis_coverage = build_analysis_coverage(
+            github_files=files,
+            chunks=chunks,
+            llm_chunks=llm_chunks,
+            budget=budget,
+            llm_enabled=not no_llm,
+        )
+        limitations.extend(chunk_selection.limitations)
+        if analysis_coverage.large_pr:
+            limitations.append(
+                "此 PR 已按大 PR 策略进行预算化分析，未深度分析的文件需要人工按覆盖率复查"
+            )
         pr_summary = _pr_summary(pr, files, commits)
         progress.emit(
             "llm",
@@ -369,6 +425,7 @@ def run_review(
             limitations=limitations,
             comment_context=comment_context,
             chunk_debug=chunk_debug if debug_chunks else [],
+            analysis_coverage=analysis_coverage,
         )
         progress.emit("aggregation", "Review 报告聚合完成", "completed")
 
@@ -462,6 +519,30 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of diff chunks to send to the LLM",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Maximum number of high-priority changed files to deep analyze",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=None,
+        help="Maximum number of high-priority diff chunks to keep as analysis candidates",
+    )
+    parser.add_argument(
+        "--max-context-files",
+        type=int,
+        default=None,
+        help="Maximum number of related context files to retrieve",
+    )
+    parser.add_argument(
+        "--max-patch-lines-per-chunk",
+        type=int,
+        default=None,
+        help="Preferred maximum patch lines per analysis chunk",
     )
     parser.add_argument(
         "--debug-chunks",

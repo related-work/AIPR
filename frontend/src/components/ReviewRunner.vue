@@ -67,6 +67,11 @@ const emit = defineEmits(["run", "apply-template", "open-command", "go-browse"])
           <span>LLM chunk 上限</span>
           <input v-model.number="form.llmMaxChunks" min="1" max="50" type="number" />
         </label>
+
+        <label class="field">
+          <span>文件预算</span>
+          <input v-model.number="form.maxFiles" min="1" max="500" type="number" />
+        </label>
       </div>
 
       <div class="toggle-grid">
@@ -114,6 +119,21 @@ const emit = defineEmits(["run", "apply-template", "open-command", "go-browse"])
               <strong>显示 chunk 调试信息</strong>
               <small>查看选择原因。</small>
             </span>
+          </label>
+
+          <label class="field">
+            <span>候选 chunk 预算</span>
+            <input v-model.number="form.maxChunks" min="1" max="1000" type="number" />
+          </label>
+
+          <label class="field">
+            <span>上下文文件预算</span>
+            <input v-model.number="form.maxContextFiles" min="1" max="200" type="number" />
+          </label>
+
+          <label class="field">
+            <span>单 chunk patch 行数</span>
+            <input v-model.number="form.maxPatchLinesPerChunk" min="20" max="2000" type="number" />
           </label>
 
           <label class="toggle-row inline-toggle danger-row">
