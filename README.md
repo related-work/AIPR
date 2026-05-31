@@ -27,6 +27,84 @@ AI PR Review 是一个本地优先的 GitHub Pull Request 智能代码评审工�
 - 开源项目维护者在合并前辅助判断是否需要阻塞。
 - 演示或比赛场景中展示 AI 代码评审完整链路。
 
+## 快速开始
+
+下面的步骤适合第一次拉取项目后快速验证 CLI 和 Web 控制台。
+
+### 1. 准备环境
+
+```bash
+python --version
+pip install -e .
+```
+
+项目要求 Python 3.11 或更高版本。若使用 conda，推荐单独创建环境：
+
+```bash
+conda create -n aipr python=3.11 -y
+conda activate aipr
+pip install -e .
+```
+
+### 2. 配置 GitHub 和模型
+
+公开仓库可以不配置 `GITHUB_TOKEN`，但建议配置以避免 rate limit：
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+export OPENAI_API_KEY=sk_xxx
+export OPENAI_MODEL=gpt-4.1-mini
+```
+
+如果使用兼容 OpenAI 的网关：
+
+```bash
+export OPENAI_BASE_URL=https://your-gateway.example.com/v1
+export OPENAI_API_MODE=chat
+export OPENAI_MODEL=your-model
+```
+
+### 3. 运行一次 CLI Review
+
+```bash
+ai-pr-review https://github.com/org/repo/pull/123 --format markdown
+```
+
+没有模型密钥时，可以先只验证规则引擎：
+
+```bash
+ai-pr-review https://github.com/org/repo/pull/123 --no-llm
+```
+
+### 4. 启动 Web 控制台
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+ai-pr-review web
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8765
+```
+
+### 5. 演示路径
+
+建议按下面顺序演示：
+
+1. 在 `本地配置` 页面运行配置诊断。
+2. 在 `PR 浏览` 页面输入 GitHub 用户或组织，选择仓库和 PR。
+3. 对单个 PR 运行 Review，查看结构化报告和 diff。
+4. 在报告页查看风险概览、finding、证据和合并建议。
+5. 勾选多个 PR 进入 `批量 Review`。
+6. 展示批量报告切换。
+7. 创建一个 Watcher，演示仓库 PR 监控配置。
+8. 打开 `质量评测` 页面运行本地固定评测集。
+
 ## 当前边界
 
 - 这是本地工具，不是多用户 Web 平台。
@@ -54,6 +132,62 @@ AI PR Review 是一个本地优先的 GitHub Pull Request 智能代码评审工�
 - Vite
 - lucide-vue
 - markdown-it
+
+## 架构设计
+
+AI PR Review 按本地优先的方式组织，核心链路是：
+
+```text
+GitHub PR URL
+  -> GitHubClient 拉取 PR 元数据、文件、diff、commit、评论上下文
+  -> diff_parser 拆分文件、hunk 和 chunk
+  -> chunk_priority / chunk_budget 排序并控制大 PR 分析预算
+  -> rules 运行确定性规则扫描
+  -> llm 对高价值 chunk 做模型分析
+  -> evidence 校验 finding 证据是否来自 diff
+  -> aggregate 合并、去重、排序并生成风险概览
+  -> render 输出 Markdown / JSON
+  -> comments / inline_comments 可选写回 GitHub
+```
+
+CLI 和 Web 共用同一套评审核心逻辑。Web 控制台只负责本地任务编排、状态保存和页面展示，不绕过 CLI 的安全默认值。
+
+### 后端模块职责
+
+| 模块 | 职责 |
+| --- | --- |
+| `cli.py` | 命令行入口、参数解析、Review 主流程编排。 |
+| `github.py` | GitHub API 调用、PR URL 解析、diff 和评论上下文拉取。 |
+| `diff_parser.py` | 将 raw diff 拆成文件、hunk、chunk。 |
+| `chunk_priority.py` | 根据路径、变更类型和风险信号排序 chunk。 |
+| `chunk_budget.py` | 控制大 PR 文件数、chunk 数和 patch 行数预算。 |
+| `rules.py` | 运行不依赖 LLM 的确定性风险规则。 |
+| `llm.py` | 调用 OpenAI 或兼容模型 API，解析结构化 finding。 |
+| `evidence.py` | 校验 finding 引用的证据是否存在于 diff。 |
+| `aggregate.py` | 合并规则和 LLM findings，计算风险概览和合并建议。 |
+| `render.py` | 输出 Markdown 和 JSON 报告。 |
+| `comments.py` | 构建 summary comment。 |
+| `inline_comments.py` | 将高置信阻塞 finding 映射为 GitHub inline comments。 |
+| `doctor.py` | 配置诊断和模型 smoke test。 |
+| `quality_eval.py` | 本地固定评测集、质量评分和快照对比。 |
+| `web.py` | 本地 HTTP API、Review job、批量任务、Watcher 和静态资源服务。 |
+
+### 前端模块职责
+
+| 组件 | 职责 |
+| --- | --- |
+| `App.vue` | 单页应用状态、API 调用和页面切换。 |
+| `AppShell.vue` | 顶层布局和导航。 |
+| `RepoBrowser.vue` | GitHub owner/repo/PR 浏览和多选。 |
+| `ReviewRunner.vue` | 单 PR Review 参数表单和运行入口。 |
+| `BatchReviewPanel.vue` | 批量 Review 队列和结果汇总。 |
+| `WatcherPanel.vue` | PR Watcher 创建、启动、暂停和检查。 |
+| `ReportViewer.vue` | Markdown/JSON 报告、diff、inline preview 和批次切换。 |
+| `HistoryPanel.vue` | 本地历史记录列表、重跑、删除和导出。 |
+| `QualityEvalPanel.vue` | 质量评测运行、快照保存和对比。 |
+| `SettingsPanel.vue` | 本地配置诊断和模型 smoke test。 |
+| `CommandModal.vue` | 命令和快捷入口。 |
+| `HelpPanel.vue` | 参数和功能帮助。 |
 
 ## 目录结构
 
@@ -137,6 +271,19 @@ export OPENAI_STRONG_MODEL=your-strong-model
 - `OPENAI_API_MODE=auto` 会先尝试 Responses API，再降级到 Chat Completions。
 - 兼容网关如果不完整支持 Responses API，建议使用 `OPENAI_API_MODE=chat`。
 
+### 常用环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `GITHUB_TOKEN` | GitHub 访问令牌，用于私有仓库、提高 rate limit 和写回评论。 |
+| `OPENAI_API_KEY` | 模型 API key。 |
+| `OPENAI_BASE_URL` | OpenAI 或兼容网关地址，兼容网关通常以 `/v1` 结尾。 |
+| `OPENAI_API_MODE` | `auto`、`responses` 或 `chat`。 |
+| `OPENAI_MODEL` | 默认模型。 |
+| `OPENAI_FAST_MODEL` | `--model fast` 使用的模型。 |
+| `OPENAI_STRONG_MODEL` | `--model accurate` 使用的模型。 |
+| `AI_PR_REVIEW_CONFIG` | 指定额外配置文件路径。 |
+
 ### 方式二：本地私密配置文件
 
 复制示例文件：
@@ -160,6 +307,29 @@ openai:
 ```
 
 `.ai-pr-review.local.yml` 已被 `.gitignore` 忽略，请不要提交。
+
+### 最小可用配置
+
+只检查公开仓库且不使用 LLM：
+
+```bash
+ai-pr-review https://github.com/org/repo/pull/123 --no-llm
+```
+
+检查公开仓库并启用 LLM：
+
+```bash
+export OPENAI_API_KEY=sk_xxx
+ai-pr-review https://github.com/org/repo/pull/123
+```
+
+检查私有仓库：
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+export OPENAI_API_KEY=sk_xxx
+ai-pr-review https://github.com/org/private-repo/pull/123
+```
 
 ### 配置优先级
 
@@ -268,6 +438,33 @@ Web 控制台包含以下页面：
 - `本地配置`：检查 GitHub/OpenAI 配置和大模型连通性。
 - `帮助`：查看常用参数说明。
 
+### Web API 概览
+
+Web 控制台通过本地 HTTP API 工作。常用接口包括：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/health` | 健康检查。 |
+| `POST` | `/api/reviews` | 创建单 PR Review job。 |
+| `GET` | `/api/reviews/{id}` | 查询 Review job 状态。 |
+| `GET` | `/api/history` | 查询本地 Review 历史。 |
+| `GET` | `/api/history/{id}` | 读取某次历史报告。 |
+| `DELETE` | `/api/history/{id}` | 删除本地历史报告。 |
+| `GET` | `/api/github/repos?owner=OWNER` | 查询用户或组织仓库。 |
+| `GET` | `/api/github/pulls?owner=OWNER&repo=REPO` | 查询仓库 PR。 |
+| `POST` | `/api/batches` | 创建批量 Review。 |
+| `GET` | `/api/batches/{id}` | 查询批量 Review 状态。 |
+| `GET` | `/api/watchers` | 查询 watcher 列表。 |
+| `POST` | `/api/watchers` | 创建 watcher。 |
+| `POST` | `/api/watchers/{id}/start` | 启动 watcher。 |
+| `POST` | `/api/watchers/{id}/pause` | 暂停 watcher。 |
+| `POST` | `/api/watchers/{id}/check` | 立即检查 watcher。 |
+| `POST` | `/api/quality-eval` | 运行质量评测。 |
+| `GET` | `/api/quality-eval/snapshots` | 查询质量评测快照。 |
+| `POST` | `/api/doctor` | 运行配置诊断。 |
+
+这些接口只监听本机地址，默认用于本地浏览器和本地 Python 服务通信，不设计为公网服务。
+
 ### PR 浏览
 
 PR 浏览页支持：
@@ -330,6 +527,59 @@ Watcher 支持持续关注一个仓库：
 - 原始输出和 JSON 输出。
 
 批量 Review 打开的报告页还会显示本批次报告切换条，可以直接查看全部报告。
+
+## 输出示例
+
+Markdown 报告会包含风险概览、合并建议、发现的问题、测试建议和限制说明。典型结构如下：
+
+```markdown
+# AI PR Review Report
+
+## Risk Overview
+
+- Critical: 0
+- High: 1
+- Medium: 2
+- Low: 1
+- Blocking: 1
+
+## Merge Recommendation
+
+do_not_merge
+
+## Findings
+
+### High
+
+- path: src/auth.py
+- line: 42
+- category: security
+- confidence: 0.93
+- blocking: true
+
+Problem:
+新增代码绕过了 token 校验。
+
+Evidence:
+`+ return True`
+
+Suggestion:
+恢复鉴权检查，并补充未授权访问测试。
+```
+
+JSON 报告适合 CI 或后续自动化消费：
+
+```bash
+ai-pr-review https://github.com/org/repo/pull/123 --format json > report.json
+```
+
+CI 中可以用 `--fail-on` 控制退出码：
+
+```bash
+ai-pr-review https://github.com/org/repo/pull/123 --fail-on high
+```
+
+当存在 blocking 且 severity 达到阈值时，命令返回非零退出码。
 
 ## 报告字段
 
@@ -519,6 +769,13 @@ ai-pr-review doctor --no-smoke
 - `--post-comment` 需要 issue comment 权限。
 - `--post-inline-comments` 需要 pull request review 权限。
 
+建议遵循最小权限原则：
+
+- 本地自查和演示：只给 public repo 读取权限即可。
+- 私有仓库评审：只给目标 repo 读取权限。
+- 需要写回评论时，再额外开启 issues / pull requests 写权限。
+- 不要把 token 写入仓库文件、截图或报告附件。
+
 ## 隐私和本地数据
 
 本工具是本地优先：
@@ -529,6 +786,15 @@ ai-pr-review doctor --no-smoke
 - `.ai-pr-review/` 不应提交。
 - 本地历史报告可能包含 PR URL、diff 片段、报告输出和代码片段。
 - 如果分析私有仓库，请把 `.ai-pr-review/` 视为私密数据。
+
+### 数据流说明
+
+- GitHub token 只在本地后端进程中读取，用于请求 GitHub API。
+- OpenAI API key 只在本地后端进程中读取，用于调用模型服务。
+- 浏览器端只看到任务状态、报告内容和脱敏配置状态。
+- Review 报告默认保存在本地 `.ai-pr-review/runs/`。
+- Watcher 状态默认保存在本地 `.ai-pr-review/watchers/`。
+- 质量评测快照默认保存在本地 `.ai-pr-review/quality-eval/`。
 
 ## 常见问题
 
@@ -602,6 +868,49 @@ npm run build
 cd ..
 PYTHONPATH=src python -m ai_pr_review web
 ```
+
+### Web 端口被占用
+
+现象：
+
+```text
+Address already in use
+```
+
+处理：
+
+```bash
+ai-pr-review web --port 8766
+```
+
+### 批量 Review 太慢
+
+可能原因：
+
+- PR 数量过多。
+- 每个 PR 的 diff 很大。
+- 模型响应慢。
+- GitHub API rate limit。
+
+处理：
+
+- 减少一次批量选择的 PR 数。
+- 使用 `fast` 模型档位。
+- 降低 `llm_max_chunks`、`max_files` 或 `max_chunks`。
+- 配置 `GITHUB_TOKEN`。
+
+### Inline 评论没有写回
+
+可能原因：
+
+- 未开启 `--post-inline-comments`。
+- finding 不是 high/critical。
+- finding 不是 blocking。
+- confidence 不够高。
+- finding 不能映射到新增 diff 行。
+- token 没有 PR review 写权限。
+
+这是预期的保护策略，避免把低置信或无法定位的问题写成代码行评论。
 
 ## 开发和验证
 
