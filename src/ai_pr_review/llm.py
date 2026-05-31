@@ -39,8 +39,13 @@ COMMENT_DERIVED_MARKERS = (
     "评论中",
     "copilot",
     "review comment",
+    "review_comment",
     "issue comment",
+    "issue_comment",
+    "pull review",
+    "pull_review",
     "comment summary",
+    "comment_summary",
 )
 
 
@@ -62,12 +67,12 @@ def analyze_chunks(
     context: RetrievedContext,
     comments_summary: str,
     model: str,
+    comment_context: CommentContext | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     api_mode: str = "auto",
     timeout_seconds: float = 45.0,
     max_chunks: int | None = None,
-    comment_context: CommentContext | None = None,
     enabled: bool = True,
 ) -> tuple[list[Finding], list[str]]:
     if not enabled:
@@ -147,6 +152,7 @@ def verify_high_risk_findings(
         finding
         for finding in findings
         if finding.severity in {"critical", "high"} and finding.confidence >= 0.75
+        and finding.source != "rule"
     ]
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not high_risk or not api_key:
@@ -178,7 +184,7 @@ def verify_high_risk_findings(
     result: list[Finding] = []
     for finding in findings:
         key = (finding.path, finding.line, finding.category)
-        if finding in high_risk and key not in verified_keys:
+        if finding.source != "rule" and finding in high_risk and key not in verified_keys:
             continue
         result.append(finding)
     return _local_verify(result), []
@@ -210,18 +216,6 @@ def _analyze_chunk(
         return ChunkAnalysis.model_validate(result.payload), result.limitations
     except ValidationError as exc:
         raise LLMError("LLM 返回结构不符合 schema，已跳过该 chunk") from exc
-
-
-def _create_client(
-    *,
-    api_key: str,
-    base_url: str | None,
-    timeout_seconds: float,
-) -> OpenAI:
-    kwargs = {"api_key": api_key, "timeout": timeout_seconds}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return OpenAI(**kwargs)
 
 
 def _call_structured(
@@ -309,7 +303,23 @@ def _call_chat(client: OpenAI, *, model: str, system: str, user: str) -> LLMCall
         except Exception as fallback_exc:
             raise LLMError(f"Chat Completions 调用失败: {fallback_exc}") from fallback_exc
 
-    return LLMCallResult(payload=_parse_json_object(text), limitations=limitations)
+    try:
+        return LLMCallResult(payload=_parse_json_object(text), limitations=limitations)
+    except LLMError:
+        if limitations:
+            raise
+        limitations.append("Chat Completions 返回非标准 JSON，已尝试从文本中提取 JSON")
+        try:
+            text = _call_chat_once(
+                client,
+                model=model,
+                system=system,
+                user=user,
+                use_response_format=False,
+            )
+            return LLMCallResult(payload=_parse_json_object(text), limitations=limitations)
+        except Exception as exc:
+            raise LLMError(f"Chat Completions 返回了不可解析 JSON: {exc}") from exc
 
 
 def _call_chat_once(
@@ -324,92 +334,218 @@ def _call_chat_once(
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": _chat_user_prompt(user)},
         ],
+        "temperature": 0,
     }
     if use_response_format:
         kwargs["response_format"] = {"type": "json_object"}
     response = client.chat.completions.create(**kwargs)
-    text = _chat_output_text(response)
+    text = _chat_response_text(response)
     if not text:
         raise LLMError("Chat Completions 未返回可解析文本")
     return text
 
 
-def _response_output_text(response) -> str:
+def _response_output_text(response: object) -> str | None:
     text = getattr(response, "output_text", None)
     if text:
         return str(text)
     try:
-        return str(response.output[0].content[0].text)
+        output = getattr(response, "output")
+        parts: list[str] = []
+        for item in output:
+            for content in getattr(item, "content", []):
+                value = _extract_text(content)
+                if value:
+                    parts.append(value)
+        return "\n".join(parts) if parts else None
     except Exception:
-        return ""
+        return None
 
 
-def _chat_output_text(response) -> str:
+def _chat_response_text(response: object) -> str | None:
+    direct_text = _extract_text(response)
+    if direct_text:
+        return direct_text
+
     if isinstance(response, dict):
-        response = _to_object(response)
-    text = getattr(response, "output_text", None)
-    if text:
-        return str(text)
-    choices = getattr(response, "choices", None) or []
-    if not choices:
-        return ""
-    choice = choices[0]
-    if isinstance(choice, dict):
-        choice = _to_object(choice)
-    message = getattr(choice, "message", None)
-    if isinstance(message, dict):
-        message = _to_object(message)
-    content = getattr(message, "content", None) if message is not None else None
-    if isinstance(content, list):
+        output_text = _extract_text(response.get("output_text"))
+        if output_text:
+            return output_text
+        choices = response.get("choices")
+        if isinstance(choices, list):
+            parts: list[str] = []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    text = _extract_text(choice)
+                    if text:
+                        parts.append(text)
+                    continue
+                message = choice.get("message")
+                if isinstance(message, dict):
+                    message_text = _extract_text(message.get("content"))
+                    if message_text:
+                        parts.append(message_text)
+                    message_text = _extract_text(message.get("text"))
+                    if message_text:
+                        parts.append(message_text)
+                choice_text = _extract_text(choice.get("text"))
+                if choice_text:
+                    parts.append(choice_text)
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    delta_text = _extract_text(delta.get("content"))
+                    if delta_text:
+                        parts.append(delta_text)
+            if parts:
+                return "\n".join(parts)
+        return None
+
+    output_text = _extract_text(getattr(response, "output_text", None))
+    if output_text:
+        return output_text
+    choices = getattr(response, "choices", None)
+    if choices:
+        parts: list[str] = []
+        for choice in choices:
+            message = getattr(choice, "message", None)
+            if message is not None:
+                content = _extract_text(getattr(message, "content", None))
+                if content:
+                    parts.append(content)
+                message_text = _extract_text(getattr(message, "text", None))
+                if message_text:
+                    parts.append(message_text)
+            choice_text = _extract_text(getattr(choice, "text", None))
+            if choice_text:
+                parts.append(choice_text)
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                delta_text = _extract_text(getattr(delta, "content", None))
+                if delta_text:
+                    parts.append(delta_text)
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def _extract_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "content", "output_text"):
+            text = _extract_text(value.get(key))
+            if text:
+                parts.append(text)
+        return "\n".join(parts) if parts else None
+    if isinstance(value, list):
         parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or ""))
-            else:
-                parts.append(str(getattr(item, "text", "")))
-        return "".join(parts)
-    if content:
-        return str(content)
-    text = getattr(choice, "text", None)
-    return str(text or "")
+        for item in value:
+            text = _extract_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts) if parts else None
+    for attr in ("text", "content", "output_text"):
+        try:
+            text = _extract_text(getattr(value, attr))
+        except Exception:
+            continue
+        if text:
+            return text
+    return None
 
 
-def _to_object(value: dict):
-    class ObjectView:
-        pass
-
-    obj = ObjectView()
-    for key, item in value.items():
-        setattr(obj, key, _to_object(item) if isinstance(item, dict) else item)
-    return obj
+def _chat_user_prompt(user: str) -> str:
+    schema = json.dumps(CHUNK_ANALYSIS_JSON_SCHEMA, ensure_ascii=False)
+    return (
+        f"{user}\n\n"
+        "请只输出一个 JSON 对象，不要输出 Markdown、解释、代码块或额外文字。"
+        "JSON 必须符合以下 schema：\n"
+        f"{schema}"
+    )
 
 
 def _parse_json_object(text: str) -> dict:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        raise LLMError("LLM 返回了非 JSON 内容") from exc
+    text = text.strip()
+    if not text:
+        raise LLMError("LLM 返回空文本")
+    if _looks_like_html(text):
+        raise LLMError(
+            "LLM 返回了 HTML 页面，OPENAI_BASE_URL 可能配置成了管理后台或网页根地址；"
+            "请改为兼容 OpenAI API 的 endpoint，通常以 /v1 结尾"
+        )
+    for candidate in _json_candidates(text):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise LLMError("LLM 返回内容不是可解析 JSON 对象")
+
+
+def _looks_like_html(text: str) -> bool:
+    lowered = text[:500].lstrip().lower()
+    return lowered.startswith("<!doctype html") or lowered.startswith("<html")
+
+
+def _json_candidates(text: str) -> list[str]:
+    candidates = [text]
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_match:
+        candidates.append(fence_match.group(1))
+    extracted = _extract_first_json_object(text)
+    if extracted:
+        candidates.append(extracted)
+    return candidates
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _create_client(
+    *,
+    api_key: str,
+    base_url: str | None = None,
+    timeout_seconds: float = 45.0,
+) -> OpenAI:
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
+    return OpenAI(api_key=api_key, timeout=timeout_seconds)
 
 
 def _is_comment_derived_finding(finding: Finding) -> bool:
-    combined = " ".join([*finding.evidence, finding.problem, finding.suggestion]).lower()
-    if not any(marker.lower() in combined for marker in COMMENT_DERIVED_MARKERS):
-        return False
-    code_like = any(
-        re.search(r"(^|\s)[+-]\s*\S+", item) or "`" in item or "diff" in item.lower()
-        for item in finding.evidence
-    )
-    return not code_like
+    text = "\n".join([*finding.evidence, finding.problem, finding.suggestion]).lower()
+    return any(marker.lower() in text for marker in COMMENT_DERIVED_MARKERS)
 
 
 def _local_verify(findings: list[Finding]) -> list[Finding]:

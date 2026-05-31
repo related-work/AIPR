@@ -77,6 +77,32 @@ class GitHubClient:
     def list_pull_reviews(self, ref: PRReference) -> list[dict[str, Any]]:
         return self._paginate(f"/repos/{ref.owner}/{ref.repo}/pulls/{ref.number}/reviews")
 
+    def list_owner_repositories(self, owner: str) -> list[dict[str, Any]]:
+        try:
+            return self._paginate(
+                f"/users/{owner}/repos",
+                params={"sort": "updated", "direction": "desc", "type": "owner"},
+            )
+        except GitHubAPIError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+        return self._paginate(
+            f"/orgs/{owner}/repos",
+            params={"sort": "updated", "direction": "desc", "type": "all"},
+        )
+
+    def list_repository_pulls(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        state: str = "open",
+    ) -> list[dict[str, Any]]:
+        return self._paginate(
+            f"/repos/{owner}/{repo}/pulls",
+            params={"state": state, "sort": "updated", "direction": "desc"},
+        )
+
     def get_pr_diff(self, ref: PRReference) -> str:
         response = self._request(
             "GET",
@@ -89,6 +115,19 @@ class GitHubClient:
         return self._post(
             f"/repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments",
             json={"body": body},
+        )
+
+    def create_pull_review(
+        self,
+        ref: PRReference,
+        *,
+        body: str,
+        comments: list[dict[str, Any]],
+        event: str = "COMMENT",
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/repos/{ref.owner}/{ref.repo}/pulls/{ref.number}/reviews",
+            json={"body": body, "event": event, "comments": comments},
         )
 
     def get_file_text(self, ref: PRReference, path: str, git_ref: str) -> str | None:
@@ -117,14 +156,16 @@ class GitHubClient:
         response = self._request("POST", path, json=json)
         return response.json()
 
-    def _paginate(self, path: str) -> list[dict[str, Any]]:
+    def _paginate(self, path: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         page = 1
         while True:
+            request_params = dict(params or {})
+            request_params.update({"per_page": 100, "page": page})
             response = self._request(
                 "GET",
                 path,
-                params={"per_page": 100, "page": page},
+                params=request_params,
             )
             batch = response.json()
             if not isinstance(batch, list):

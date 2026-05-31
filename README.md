@@ -21,9 +21,41 @@ ai-pr-review https://github.com/org/repo/pull/123 --with-context
 ai-pr-review https://github.com/org/repo/pull/123 --no-llm
 ai-pr-review https://github.com/org/repo/pull/123 --llm-max-chunks 2
 ai-pr-review https://github.com/org/repo/pull/123 --post-comment
+ai-pr-review https://github.com/org/repo/pull/123 --post-inline-comments
 ```
 
-Default behavior prints a report to the terminal and does not write back to GitHub. `--post-comment` is required to create a PR comment.
+Default behavior prints a report to the terminal and does not write back to GitHub. `--post-comment` is required to create a PR summary comment. `--post-inline-comments` creates GitHub inline review comments only for high/critical, blocking, high-confidence findings that can be mapped to newly added diff lines.
+
+### Local Web Console
+
+The project also includes a Vue command generator and local review runner.
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+PYTHONPATH=src python -m ai_pr_review web
+```
+
+Open `http://127.0.0.1:8765`.
+
+The page supports two workflows:
+
+- Generate a copyable CLI command from PR URL and options.
+- Run the review through the local Python API and view the report in the browser.
+- Enter a GitHub user or organization, load repositories, select a repository, and auto-fill an open PR.
+
+The browser never receives `GITHUB_TOKEN`, `OPENAI_API_KEY`, or local config secrets. The local Python process reads credentials from environment variables or `.ai-pr-review.local.yml`, then runs the same CLI review path used by the terminal command.
+
+GitHub browsing uses the same local GitHub token resolution as the CLI. Public repositories can be browsed without a token, but GitHub applies stricter anonymous rate limits.
+
+Useful web server options:
+
+```bash
+PYTHONPATH=src python -m ai_pr_review web --host 127.0.0.1 --port 8765
+PYTHONPATH=src python -m ai_pr_review web --frontend-dir frontend/dist
+```
 
 ## Environment
 
