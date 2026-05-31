@@ -1,8 +1,9 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
-import { Activity, FileText, History, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
+import { Activity, FileText, History, ListChecks, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
 
 import AppShell from "./components/AppShell.vue";
+import BatchReviewPanel from "./components/BatchReviewPanel.vue";
 import CommandModal from "./components/CommandModal.vue";
 import HelpPanel from "./components/HelpPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
@@ -11,6 +12,7 @@ import RepoBrowser from "./components/RepoBrowser.vue";
 import ReportViewer from "./components/ReportViewer.vue";
 import ReviewRunner from "./components/ReviewRunner.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import WatcherPanel from "./components/WatcherPanel.vue";
 
 const activeView = ref("browse");
 
@@ -25,6 +27,10 @@ const form = reactive({
   withContext: false,
   noLlm: false,
   llmMaxChunks: 2,
+  maxFiles: 80,
+  maxChunks: 40,
+  maxContextFiles: 20,
+  maxPatchLinesPerChunk: 400,
   debugChunks: true
 });
 
@@ -46,6 +52,16 @@ const showCommand = ref(false);
 const copied = ref(false);
 const job = ref(null);
 const runError = ref("");
+const batchJob = ref(null);
+const batchError = ref("");
+const batchPollingTimer = ref(null);
+const reportCollection = ref({ title: "", jobs: [] });
+const selectedBatchPullUrls = ref([]);
+const watchers = ref([]);
+const watcherError = ref("");
+const loadingWatchers = ref(false);
+const creatingWatcher = ref(false);
+const watcherPollingTimer = ref(null);
 const historyJobs = ref([]);
 const historyError = ref("");
 const loadingHistory = ref(false);
@@ -63,6 +79,19 @@ const qualityCompareBase = ref("");
 const qualityCompareTarget = ref("");
 const qualityComparison = ref(null);
 const qualityComparisonError = ref("");
+const watcherForm = reactive({
+  intervalSeconds: 300,
+  includeDrafts: false,
+  model: "fast",
+  changedOnly: true,
+  withContext: false,
+  noLlm: false,
+  llmMaxChunks: 2,
+  maxFiles: 80,
+  maxChunks: 40,
+  maxContextFiles: 20,
+  maxPatchLinesPerChunk: 400
+});
 const historyFilters = reactive({
   query: "",
   status: "",
@@ -74,6 +103,8 @@ const historyFilters = reactive({
 const navItems = [
   { id: "browse", label: "PR 浏览", icon: SearchCode },
   { id: "review", label: "Review 运行", icon: Play },
+  { id: "batch", label: "批量 Review", icon: ListChecks },
+  { id: "watch", label: "PR 监控", icon: Activity },
   { id: "report", label: "报告结果", icon: FileText },
   { id: "history", label: "历史记录", icon: History },
   { id: "quality", label: "质量评测", icon: Activity },
@@ -93,6 +124,10 @@ const templates = [
       withContext: false,
       noLlm: true,
       llmMaxChunks: 2,
+      maxFiles: 80,
+      maxChunks: 40,
+      maxContextFiles: 20,
+      maxPatchLinesPerChunk: 400,
       debugChunks: true,
       postComment: false,
       postInlineComments: false
@@ -109,6 +144,10 @@ const templates = [
       withContext: false,
       noLlm: false,
       llmMaxChunks: 2,
+      maxFiles: 80,
+      maxChunks: 40,
+      maxContextFiles: 20,
+      maxPatchLinesPerChunk: 400,
       debugChunks: true,
       postComment: false,
       postInlineComments: false
@@ -125,6 +164,10 @@ const templates = [
       withContext: true,
       noLlm: false,
       llmMaxChunks: 6,
+      maxFiles: 120,
+      maxChunks: 80,
+      maxContextFiles: 30,
+      maxPatchLinesPerChunk: 400,
       debugChunks: true,
       postComment: false,
       postInlineComments: false
@@ -141,6 +184,10 @@ const templates = [
       withContext: false,
       noLlm: false,
       llmMaxChunks: 2,
+      maxFiles: 80,
+      maxChunks: 40,
+      maxContextFiles: 20,
+      maxPatchLinesPerChunk: 400,
       debugChunks: false,
       postComment: false,
       postInlineComments: false
@@ -158,13 +205,21 @@ const optionDocs = [
   { title: "--with-context", body: "检索同名测试、相邻模块、配置文件等上下文。changed-only 开启时不会生效。" },
   { title: "--no-llm", body: "跳过模型，只运行规则引擎，适合快速检查明确风险。" },
   { title: "--llm-max-chunks", body: "限制送入模型的 diff chunk 数量。越大越全面，也越慢越贵。" },
+  { title: "--max-files", body: "限制进入深度分析的高优先级文件数，大 PR 用它控制范围。" },
+  { title: "--max-chunks", body: "限制进入分析候选集的高优先级 chunk 数量。" },
+  { title: "--max-context-files", body: "限制上下文检索文件数，避免复杂 PR 拉取过多无关文件。" },
+  { title: "--max-patch-lines-per-chunk", body: "单个 chunk 的目标 patch 行数预算，报告会记录该预算。" },
   { title: "--debug-chunks", body: "在报告中展示 chunk 排序和选择原因，方便调试分析覆盖。" }
 ];
 
 const isRunning = computed(() => ["queued", "running"].includes(job.value?.status));
+const isBatchRunning = computed(() => ["queued", "running"].includes(batchJob.value?.status));
+const isWatcherRunning = computed(() => watchers.value.some((watcher) => watcher.status === "running"));
 const isBrowsing = computed(() => loadingRepos.value || loadingPulls.value);
 const selectedRepo = computed(() => repos.value.find((repo) => repo.name === explorer.repo));
 const selectedPull = computed(() => pulls.value.find((pull) => pull.url === explorer.pullUrl));
+const selectedBatchPulls = computed(() => pulls.value.filter((pull) => selectedBatchPullUrls.value.includes(pull.url)));
+const showPrContext = computed(() => ["review", "report"].includes(activeView.value));
 const selectedPrLabel = computed(() => {
   if (selectedPull.value) {
     return `#${selectedPull.value.number} ${selectedPull.value.title}`;
@@ -198,6 +253,10 @@ const cliArgs = computed(() => {
   if (form.withContext) args.push("--with-context");
   if (form.noLlm) args.push("--no-llm");
   if (form.llmMaxChunks) args.push("--llm-max-chunks", String(form.llmMaxChunks));
+  if (form.maxFiles) args.push("--max-files", String(form.maxFiles));
+  if (form.maxChunks) args.push("--max-chunks", String(form.maxChunks));
+  if (form.maxContextFiles) args.push("--max-context-files", String(form.maxContextFiles));
+  if (form.maxPatchLinesPerChunk) args.push("--max-patch-lines-per-chunk", String(form.maxPatchLinesPerChunk));
   if (form.debugChunks) args.push("--debug-chunks");
   return args;
 });
@@ -244,6 +303,7 @@ async function loadRepositories() {
   browseError.value = "";
   repos.value = [];
   pulls.value = [];
+  selectedBatchPullUrls.value = [];
   explorer.repo = "";
   explorer.pullUrl = "";
   loadingRepos.value = true;
@@ -272,6 +332,7 @@ async function loadPullRequests() {
   }
   browseError.value = "";
   pulls.value = [];
+  selectedBatchPullUrls.value = [];
   explorer.pullUrl = "";
   loadingPulls.value = true;
   try {
@@ -306,6 +367,10 @@ function proceedToReview() {
   activeView.value = "review";
 }
 
+function proceedToBatch() {
+  activeView.value = "batch";
+}
+
 function requestPayload() {
   return {
     prUrl: form.prUrl.trim(),
@@ -318,6 +383,10 @@ function requestPayload() {
     withContext: form.withContext,
     noLlm: form.noLlm,
     llmMaxChunks: form.llmMaxChunks || null,
+    maxFiles: form.maxFiles || null,
+    maxChunks: form.maxChunks || null,
+    maxContextFiles: form.maxContextFiles || null,
+    maxPatchLinesPerChunk: form.maxPatchLinesPerChunk || null,
     debugChunks: form.debugChunks
   };
 }
@@ -333,6 +402,10 @@ function applyRequest(request) {
   form.withContext = Boolean(request.withContext);
   form.noLlm = Boolean(request.noLlm);
   form.llmMaxChunks = request.llmMaxChunks || form.llmMaxChunks;
+  form.maxFiles = request.maxFiles || form.maxFiles;
+  form.maxChunks = request.maxChunks || form.maxChunks;
+  form.maxContextFiles = request.maxContextFiles || form.maxContextFiles;
+  form.maxPatchLinesPerChunk = request.maxPatchLinesPerChunk || form.maxPatchLinesPerChunk;
   form.debugChunks = Boolean(request.debugChunks);
 }
 
@@ -341,6 +414,7 @@ async function runReview() {
     return;
   }
   runError.value = "";
+  reportCollection.value = { title: "", jobs: [] };
   job.value = null;
   activeView.value = "report";
   try {
@@ -358,6 +432,244 @@ async function runReview() {
   } catch (error) {
     runError.value = error.message;
   }
+}
+
+function toggleBatchPull(url) {
+  if (selectedBatchPullUrls.value.includes(url)) {
+    selectedBatchPullUrls.value = selectedBatchPullUrls.value.filter((item) => item !== url);
+    return;
+  }
+  selectedBatchPullUrls.value = [...selectedBatchPullUrls.value, url];
+}
+
+function selectAllBatchPulls() {
+  selectedBatchPullUrls.value = pulls.value.map((pull) => pull.url);
+}
+
+function clearBatchSelection() {
+  selectedBatchPullUrls.value = [];
+}
+
+async function runBatchReview() {
+  if (isBatchRunning.value) {
+    return;
+  }
+  if (!selectedBatchPulls.value.length) {
+    batchError.value = "请先选择至少一个 PR";
+    return;
+  }
+  batchError.value = "";
+  reportCollection.value = { title: "", jobs: [] };
+  batchJob.value = null;
+  const requests = selectedBatchPulls.value.map((pull) => ({
+    ...requestPayload(),
+    prUrl: pull.url,
+    format: "json",
+    postComment: false,
+    postInlineComments: false
+  }));
+  try {
+    const response = await fetch("/api/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "启动批量 Review 失败");
+    }
+    batchJob.value = payload;
+    pollBatch(payload.id);
+  } catch (error) {
+    batchError.value = error.message;
+  }
+}
+
+function pollBatch(batchId) {
+  window.clearInterval(batchPollingTimer.value);
+  batchPollingTimer.value = window.setInterval(async () => {
+    try {
+      const response = await fetch(`/api/batches/${batchId}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "获取批量任务状态失败");
+      }
+      batchJob.value = payload;
+      if (!["queued", "running"].includes(payload.status)) {
+        window.clearInterval(batchPollingTimer.value);
+        loadHistory();
+      }
+    } catch (error) {
+      batchError.value = error.message;
+      window.clearInterval(batchPollingTimer.value);
+    }
+  }, 900);
+}
+
+async function openBatchReport(item) {
+  if (!item.jobId) {
+    return;
+  }
+  await openBatchReports(item.jobId);
+}
+
+async function openBatchReports(selectedJobId = null) {
+  const items = (batchJob.value?.items || []).filter((item) => item.jobId);
+  if (!items.length) {
+    batchError.value = "当前批量任务还没有可打开的报告";
+    return;
+  }
+  batchError.value = "";
+  runError.value = "";
+  try {
+    const jobs = await Promise.all(items.map(async (item) => {
+      const response = await fetch(`/api/reviews/${item.jobId}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "读取批量报告失败");
+      }
+      return { ...payload, batchItem: item };
+    }));
+    reportCollection.value = {
+      title: `批量报告 · ${jobs.length} 个 PR`,
+      jobs
+    };
+    job.value = jobs.find((item) => item.id === selectedJobId) || jobs[0];
+    activeView.value = "report";
+  } catch (error) {
+    batchError.value = error.message;
+  }
+}
+
+function selectReportFromCollection(jobId) {
+  const selected = reportCollection.value.jobs.find((item) => item.id === jobId);
+  if (selected) {
+    job.value = selected;
+  }
+}
+
+function watcherPayload() {
+  return {
+    owner: explorer.owner.trim(),
+    repo: explorer.repo.trim(),
+    intervalSeconds: watcherForm.intervalSeconds,
+    includeDrafts: watcherForm.includeDrafts,
+    model: watcherForm.model,
+    changedOnly: watcherForm.changedOnly,
+    withContext: watcherForm.withContext,
+    noLlm: watcherForm.noLlm,
+    llmMaxChunks: watcherForm.llmMaxChunks,
+    maxFiles: watcherForm.maxFiles,
+    maxChunks: watcherForm.maxChunks,
+    maxContextFiles: watcherForm.maxContextFiles,
+    maxPatchLinesPerChunk: watcherForm.maxPatchLinesPerChunk
+  };
+}
+
+async function loadWatchers() {
+  watcherError.value = "";
+  loadingWatchers.value = true;
+  try {
+    const response = await fetch("/api/watchers");
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取监控状态失败");
+    }
+    watchers.value = payload.watchers || [];
+  } catch (error) {
+    watcherError.value = error.message;
+  } finally {
+    loadingWatchers.value = false;
+  }
+}
+
+async function createWatcher() {
+  if (creatingWatcher.value) {
+    return;
+  }
+  if (!explorer.owner.trim() || !explorer.repo.trim()) {
+    watcherError.value = "请输入 owner 和 repo";
+    return;
+  }
+  watcherError.value = "";
+  creatingWatcher.value = true;
+  try {
+    const response = await fetch("/api/watchers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(watcherPayload())
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "创建监控失败");
+    }
+    await loadWatchers();
+  } catch (error) {
+    watcherError.value = error.message;
+  } finally {
+    creatingWatcher.value = false;
+  }
+}
+
+async function watcherAction(watcher, action) {
+  watcherError.value = "";
+  try {
+    const response = await fetch(`/api/watchers/${encodeURIComponent(watcher.id)}/${action}`, {
+      method: "POST"
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "监控操作失败");
+    }
+    await loadWatchers();
+    loadHistory();
+  } catch (error) {
+    watcherError.value = error.message;
+  }
+}
+
+async function deleteWatcher(watcher) {
+  if (!window.confirm(`删除监控 ${watcher.request.owner}/${watcher.request.repo}？`)) {
+    return;
+  }
+  watcherError.value = "";
+  try {
+    const response = await fetch(`/api/watchers/${encodeURIComponent(watcher.id)}`, {
+      method: "DELETE"
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "删除监控失败");
+    }
+    await loadWatchers();
+  } catch (error) {
+    watcherError.value = error.message;
+  }
+}
+
+async function openWatcherReport(review) {
+  if (!review.jobId) {
+    return;
+  }
+  watcherError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${review.jobId}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取监控报告失败");
+    }
+    reportCollection.value = { title: "", jobs: [] };
+    job.value = payload;
+    activeView.value = "report";
+  } catch (error) {
+    watcherError.value = error.message;
+  }
+}
+
+function startWatcherPolling() {
+  window.clearInterval(watcherPollingTimer.value);
+  loadWatchers();
+  watcherPollingTimer.value = window.setInterval(loadWatchers, 3000);
 }
 
 async function loadHistory() {
@@ -554,6 +866,7 @@ async function viewHistoryJob(historyJob) {
     if (!response.ok) {
       throw new Error(payload.error || "读取历史报告失败");
     }
+    reportCollection.value = { title: "", jobs: [] };
     job.value = payload;
     activeView.value = "report";
   } catch (error) {
@@ -562,12 +875,16 @@ async function viewHistoryJob(historyJob) {
 }
 
 function rerunHistoryJob(historyJob) {
+  reportCollection.value = { title: "", jobs: [] };
   applyRequest(historyJob.request);
   activeView.value = "review";
 }
 
 function navigate(view) {
   activeView.value = view;
+  if (view !== "watch") {
+    window.clearInterval(watcherPollingTimer.value);
+  }
   if (view === "history") {
     loadHistory();
   }
@@ -576,6 +893,12 @@ function navigate(view) {
   }
   if (view === "quality" && !qualitySnapshots.value.length) {
     loadQualitySnapshots();
+  }
+  if (view === "batch" && !pulls.value.length && explorer.repo) {
+    loadPullRequests();
+  }
+  if (view === "watch") {
+    startWatcherPolling();
   }
 }
 
@@ -602,15 +925,18 @@ function pollJob(jobId) {
 
 onBeforeUnmount(() => {
   window.clearInterval(pollingTimer.value);
+  window.clearInterval(batchPollingTimer.value);
+  window.clearInterval(watcherPollingTimer.value);
 });
 </script>
 
 <template>
   <AppShell
     :active-view="activeView"
-    :is-running="isRunning"
+    :is-running="isRunning || isBatchRunning || isWatcherRunning"
     :nav-items="navItems"
     :selected-pr-label="selectedPrLabel"
+    :show-pr-context="showPrContext"
     @navigate="navigate"
     @open-command="showCommand = true"
   >
@@ -626,10 +952,15 @@ onBeforeUnmount(() => {
       :repos="repos"
       :selected-pull="selectedPull"
       :selected-repo="selectedRepo"
+      :selected-urls="selectedBatchPullUrls"
       @apply-selected-pull="applySelectedPull"
+      @clear-selection="clearBatchSelection"
       @load-pulls="loadPullRequests"
       @load-repositories="loadRepositories"
+      @proceed-batch="proceedToBatch"
       @proceed-review="proceedToReview"
+      @select-all="selectAllBatchPulls"
+      @toggle-pull="toggleBatchPull"
     />
 
     <ReviewRunner
@@ -647,12 +978,52 @@ onBeforeUnmount(() => {
       @run="runReview"
     />
 
+    <BatchReviewPanel
+      v-else-if="activeView === 'batch'"
+      :batch-error="batchError"
+      :batch-job="batchJob"
+      :is-running="isBatchRunning"
+      :loading-pulls="loadingPulls"
+      :pulls="pulls"
+      :selected-repo="selectedRepo"
+      :selected-urls="selectedBatchPullUrls"
+      @clear-selection="clearBatchSelection"
+      @go-browse="activeView = 'browse'"
+      @open-batch-reports="openBatchReports"
+      @open-report="openBatchReport"
+      @run="runBatchReview"
+      @select-all="selectAllBatchPulls"
+      @toggle-pull="toggleBatchPull"
+    />
+
+    <WatcherPanel
+      v-else-if="activeView === 'watch'"
+      :creating="creatingWatcher"
+      :error="watcherError"
+      :explorer="explorer"
+      :form="watcherForm"
+      :loading="loadingWatchers"
+      :watchers="watchers"
+      @check="watcherAction($event, 'check')"
+      @create="createWatcher"
+      @delete="deleteWatcher"
+      @go-browse="activeView = 'browse'"
+      @open-report="openWatcherReport"
+      @pause="watcherAction($event, 'pause')"
+      @refresh="loadWatchers"
+      @start="watcherAction($event, 'start')"
+    />
+
     <ReportViewer
       v-else-if="activeView === 'report'"
       :job="job"
       :output-text="outputText"
+      :related-reports="reportCollection.jobs"
+      :report-collection-title="reportCollection.title"
       :run-error="runError"
+      @go-batch="activeView = 'batch'"
       @go-runner="activeView = 'review'"
+      @select-report="selectReportFromCollection"
     />
 
     <HistoryPanel

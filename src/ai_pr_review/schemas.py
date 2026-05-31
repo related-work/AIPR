@@ -18,6 +18,7 @@ Category = Literal[
 ]
 MergeRecommendation = Literal["merge", "merge_with_suggestions", "do_not_merge"]
 FindingSource = Literal["rule", "llm", "verifier"]
+FileCoverageStatus = Literal["analyzed", "rule_only", "skipped"]
 
 
 class Finding(BaseModel):
@@ -62,6 +63,56 @@ class ChunkSummary(BaseModel):
     selected: bool = False
 
 
+class BudgetLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    max_files: int | None = Field(default=None, alias="maxFiles")
+    max_chunks: int | None = Field(default=None, alias="maxChunks")
+    max_llm_chunks: int | None = Field(default=None, alias="maxLlmChunks")
+    max_context_files: int | None = Field(default=None, alias="maxContextFiles")
+    max_patch_lines_per_chunk: int | None = Field(
+        default=None,
+        alias="maxPatchLinesPerChunk",
+    )
+
+
+class SkippedReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    count: int
+
+
+class AnalysisFileCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    path: str
+    status: FileCoverageStatus
+    reason: str
+    risk_score: int = Field(default=0, alias="riskScore")
+    reasons: list[str] = Field(default_factory=list)
+    high_risk_unreviewed: bool = Field(default=False, alias="highRiskUnreviewed")
+
+
+class AnalysisCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    large_pr: bool = Field(default=False, alias="largePr")
+    changed_files: int = Field(default=0, alias="changedFiles")
+    analyzed_files: int = Field(default=0, alias="analyzedFiles")
+    skipped_files: int = Field(default=0, alias="skippedFiles")
+    total_chunks: int = Field(default=0, alias="totalChunks")
+    llm_analyzed_chunks: int = Field(default=0, alias="llmAnalyzedChunks")
+    rules_scanned_files: int = Field(default=0, alias="rulesScannedFiles")
+    coverage_ratio: float = Field(default=1.0, alias="coverageRatio")
+    budget_limits: BudgetLimits = Field(default_factory=BudgetLimits, alias="budgetLimits")
+    skipped_reasons: list[SkippedReason] = Field(default_factory=list, alias="skippedReasons")
+    file_coverage: list[AnalysisFileCoverage] = Field(
+        default_factory=list,
+        alias="fileCoverage",
+    )
+
+
 class RiskOverview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -102,7 +153,7 @@ class CommentContext(BaseModel):
 
 
 class ReviewReport(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     pr_url: str
     title: str
@@ -112,6 +163,10 @@ class ReviewReport(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     comment_context: CommentContext = Field(default_factory=CommentContext)
     chunk_debug: list[ChunkSummary] = Field(default_factory=list)
+    analysis_coverage: AnalysisCoverage = Field(
+        default_factory=AnalysisCoverage,
+        alias="analysisCoverage",
+    )
     test_suggestions: list[str] = Field(default_factory=list)
     merge_recommendation: MergeRecommendation
     limitations: list[str] = Field(default_factory=list)
