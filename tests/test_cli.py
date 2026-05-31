@@ -5,6 +5,7 @@ import json
 
 from ai_pr_review import cli
 from ai_pr_review.config import ReviewConfig
+from ai_pr_review.progress import read_progress_events
 from ai_pr_review.doctor import DoctorReport
 from ai_pr_review.schemas import Finding, ReviewReport, RiskOverview
 
@@ -398,3 +399,81 @@ diff --git a/src/app/users.py b/src/app/users.py
     assert report.chunk_debug[0].selected is True
     assert report.chunk_debug[1].path == "src/ui.py"
     assert report.chunk_debug[1].selected is False
+
+
+def test_run_review_emits_progress_events(monkeypatch, tmp_path) -> None:
+    class FakeGitHub:
+        def __init__(self, token=None):
+            self.token = token
+
+        def get_pr(self, ref):
+            return {
+                "html_url": ref.html_url,
+                "title": "Fake PR",
+                "body": "",
+                "head": {"sha": "abc123"},
+            }
+
+        def list_pr_files(self, ref):
+            return [
+                {
+                    "filename": "src/app.py",
+                    "additions": 1,
+                    "deletions": 0,
+                    "patch": "@@ -1 +1 @@\n+return 1",
+                }
+            ]
+
+        def list_pr_commits(self, ref):
+            return []
+
+        def list_issue_comments(self, ref):
+            return []
+
+        def list_review_comments(self, ref):
+            return []
+
+        def list_pull_reviews(self, ref):
+            return []
+
+        def get_pr_diff(self, ref):
+            return """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1 @@
++return 1
+"""
+
+        def close(self):
+            pass
+
+    progress_file = tmp_path / "progress.jsonl"
+
+    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
+    monkeypatch.setattr(cli, "load_config", lambda: ReviewConfig())
+    monkeypatch.setenv("AI_PR_REVIEW_PROGRESS_FILE", str(progress_file))
+
+    cli.run_review(
+        pr_url="https://github.com/org/repo/pull/1",
+        output_format="markdown",
+        post_comment=False,
+        fail_on=None,
+        model_profile="fast",
+        changed_only=True,
+        with_context=False,
+        no_llm=True,
+        llm_max_chunks=None,
+        post_inline_comments=False,
+    )
+
+    events = read_progress_events(progress_file)
+    stages = [(event["stage"], event["status"]) for event in events]
+
+    assert ("github_fetch", "running") in stages
+    assert ("github_fetch", "completed") in stages
+    assert ("diff_parse", "completed") in stages
+    assert ("rules", "completed") in stages
+    assert ("llm", "skipped") in stages
+    assert ("verification", "skipped") in stages
+    assert ("aggregation", "completed") in stages
+    assert ("writeback", "skipped") in stages

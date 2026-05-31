@@ -27,6 +27,7 @@ from ai_pr_review.evidence import verify_finding_evidence
 from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_pr_url
 from ai_pr_review.inline_comments import build_inline_review_comments
 from ai_pr_review.llm import analyze_chunks, select_models, verify_high_risk_findings
+from ai_pr_review.progress import ProgressReporter
 from ai_pr_review.render import render_json, render_markdown
 from ai_pr_review.rules import run_rules
 from ai_pr_review.schemas import ReviewReport
@@ -190,11 +191,13 @@ def run_review(
     llm_max_chunks: int | None = None,
     debug_chunks: bool = False,
 ) -> ReviewReport:
+    progress = ProgressReporter.from_env()
     config = load_config()
     effective_fail_on = fail_on or config.review.fail_on
     ref = parse_pr_url(pr_url)
     github = GitHubClient(token=resolve_github_token(config))
     try:
+        progress.emit("github_fetch", "获取 GitHub PR 数据", "running")
         pr = github.get_pr(ref)
         files = github.list_pr_files(ref)
         commits = github.list_pr_commits(ref)
@@ -202,6 +205,9 @@ def run_review(
         review_comments = github.list_review_comments(ref)
         pull_reviews = github.list_pull_reviews(ref)
         raw_diff = github.get_pr_diff(ref)
+        progress.emit("github_fetch", "GitHub PR 数据获取完成", "completed")
+
+        progress.emit("diff_parse", "解析 PR diff", "running")
         comment_context = build_comment_context(
             issue_comments=issue_comments,
             review_comments=review_comments,
@@ -215,6 +221,15 @@ def run_review(
             changed_only=changed_only,
             ignore_paths=config.review.ignore_paths,
         )
+        progress.emit(
+            "diff_parse",
+            "PR diff 解析完成",
+            "completed",
+            f"{len(diff_files)} 个文件，{len(chunks)} 个分析块",
+        )
+
+        if with_context and not changed_only:
+            progress.emit("context", "检索相关上下文", "running")
         context = retrieve_context(
             github,
             ref,
@@ -223,8 +238,16 @@ def run_review(
             enabled=with_context and not changed_only,
         )
         limitations.extend(context.limitations)
+        progress.emit(
+            "context",
+            "上下文检索完成" if with_context and not changed_only else "上下文检索已跳过",
+            "completed" if with_context and not changed_only else "skipped",
+        )
 
+        progress.emit("rules", "运行规则引擎", "running")
         rule_findings = run_rules(files, diff_files, config)
+        progress.emit("rules", "规则引擎扫描完成", "completed", f"{len(rule_findings)} 条规则 finding")
+
         fast_model, strong_model = select_models(config, model_profile)
         openai_api_key = resolve_openai_api_key(config)
         openai_base_url = resolve_openai_base_url(config)
@@ -240,6 +263,12 @@ def run_review(
         )
         limitations.extend(chunk_limitations)
         pr_summary = _pr_summary(pr, files, commits)
+        progress.emit(
+            "llm",
+            "LLM 分块分析" if not no_llm else "LLM 分析已跳过",
+            "running" if not no_llm else "skipped",
+            f"{len(llm_chunks)} 个 chunk",
+        )
         llm_findings, llm_limitations = analyze_chunks(
             llm_chunks,
             pr_summary=pr_summary,
@@ -255,7 +284,14 @@ def run_review(
             enabled=not no_llm,
         )
         limitations.extend(llm_limitations)
+        if not no_llm:
+            progress.emit("llm", "LLM 分析完成", "completed", f"{len(llm_findings)} 条 LLM finding")
 
+        progress.emit(
+            "verification",
+            "复核高风险 finding" if not no_llm else "高风险复核已跳过",
+            "running" if not no_llm else "skipped",
+        )
         verified_findings, verify_limitations = verify_high_risk_findings(
             [*rule_findings, *llm_findings],
             context=context,
@@ -267,6 +303,9 @@ def run_review(
             enabled=not no_llm,
         )
         limitations.extend(verify_limitations)
+        if not no_llm:
+            progress.emit("verification", "高风险复核完成", "completed", f"{len(verified_findings)} 条 finding")
+
         evidence_findings, evidence_limitations = verify_finding_evidence(
             verified_findings,
             diff_files=diff_files,
@@ -274,6 +313,7 @@ def run_review(
         )
         limitations.extend(evidence_limitations)
 
+        progress.emit("aggregation", "聚合 Review 报告", "running")
         report = aggregate_report(
             pr=pr,
             files=files,
@@ -284,7 +324,12 @@ def run_review(
             comment_context=comment_context,
             chunk_debug=chunk_debug if debug_chunks else [],
         )
+        progress.emit("aggregation", "Review 报告聚合完成", "completed")
 
+        if post_comment or post_inline_comments:
+            progress.emit("writeback", "写回 GitHub 评论", "running")
+        else:
+            progress.emit("writeback", "GitHub 写回已跳过", "skipped")
         if post_comment:
             rendered = render_json(report) if output_format == "json" else render_markdown(report)
             github.create_issue_comment(ref, rendered)
@@ -297,7 +342,12 @@ def run_review(
                     body="AI PR Review inline comments",
                     comments=comments,
                 )
+        if post_comment or post_inline_comments:
+            progress.emit("writeback", "GitHub 评论写回完成", "completed")
         return report
+    except Exception as exc:
+        progress.emit("failed", "Review 执行失败", "failed", str(exc))
+        raise
     finally:
         github.close()
 

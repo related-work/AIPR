@@ -45,10 +45,13 @@ The page supports two workflows:
 - Generate a copyable CLI command from PR URL and options.
 - Run the review through the local Python API and view the report in the browser.
 - Enter a GitHub user or organization, load repositories, select a repository, and auto-fill an open PR.
+- View recent review runs in the History view, reopen reports, and rerun with the same options.
 
 The browser never receives `GITHUB_TOKEN`, `OPENAI_API_KEY`, or local config secrets. The local Python process reads credentials from environment variables or `.ai-pr-review.local.yml`, then runs the same CLI review path used by the terminal command.
 
 GitHub browsing uses the same local GitHub token resolution as the CLI. Public repositories can be browsed without a token, but GitHub applies stricter anonymous rate limits.
+
+Review history is persisted locally under `.ai-pr-review/runs/` and is ignored by git. These files can contain PR URLs, report output, and code snippets from analyzed diffs, so treat the directory as private local data.
 
 Useful web server options:
 

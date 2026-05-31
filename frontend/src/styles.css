@@ -356,6 +356,7 @@ h1 {
 
 .template-row button,
 .ghost-button,
+.danger-button,
 .primary-button,
 .secondary-wide-button,
 .load-button,
@@ -376,6 +377,7 @@ h1 {
 }
 
 .ghost-button,
+.danger-button,
 .template-row button,
 .secondary-wide-button {
   border: 1px solid #cbd5e1;
@@ -391,6 +393,16 @@ h1 {
   color: #0f766e;
 }
 
+.danger-button {
+  color: #be123c;
+  padding: 0 12px;
+}
+
+.danger-button:hover {
+  border-color: #be123c;
+  color: #be123c;
+}
+
 .primary-button,
 .load-button {
   border: 1px solid #0f766e;
@@ -404,7 +416,9 @@ h1 {
 }
 
 .primary-button:disabled,
-.load-button:disabled {
+.load-button:disabled,
+.ghost-button:disabled,
+.danger-button:disabled {
   cursor: not-allowed;
   opacity: 0.62;
   transform: none;
@@ -542,6 +556,82 @@ h1 {
   margin-bottom: 12px;
 }
 
+.history-panel {
+  padding: 18px;
+}
+
+.history-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.history-filters {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.4fr) minmax(160px, 1fr) 130px 145px 145px auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 14px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 12px;
+}
+
+.history-list {
+  display: grid;
+  gap: 10px;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 12px;
+}
+
+.history-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.history-title strong {
+  color: #111827;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.history-item p {
+  margin-top: 6px;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.history-item small {
+  display: block;
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.icon-action {
+  min-width: 72px;
+}
+
 .report-tabs {
   display: inline-grid;
   grid-template-columns: repeat(3, auto);
@@ -568,6 +658,93 @@ h1 {
   background: #ffffff;
   color: #0f766e;
   box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+}
+
+.progress-timeline {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 12px;
+}
+
+.progress-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.progress-heading h3 {
+  color: #111827;
+  font-size: 15px;
+}
+
+.progress-heading span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.progress-timeline ol {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.progress-timeline li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.progress-marker {
+  width: 11px;
+  height: 11px;
+  margin-top: 4px;
+  border-radius: 999px;
+  background: #94a3b8;
+}
+
+.progress-marker.running {
+  background: #d97706;
+}
+
+.progress-marker.completed {
+  background: #16a34a;
+}
+
+.progress-marker.failed {
+  background: #be123c;
+}
+
+.progress-marker.skipped {
+  background: #64748b;
+}
+
+.progress-timeline strong {
+  color: #111827;
+  font-size: 13px;
+}
+
+.progress-timeline small {
+  display: block;
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.progress-timeline p {
+  margin-top: 4px;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .result-output {
@@ -688,6 +865,164 @@ h1 {
   font-weight: 750;
 }
 
+.structured-report {
+  display: grid;
+  gap: 18px;
+  min-height: 520px;
+  max-height: calc(100vh - 250px);
+  overflow: auto;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 18px;
+}
+
+.risk-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.risk-card {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 12px;
+}
+
+.risk-card span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.risk-card strong {
+  color: #111827;
+  font-size: 22px;
+  overflow-wrap: anywhere;
+}
+
+.wide-risk {
+  grid-column: span 2;
+}
+
+.finding-section {
+  display: grid;
+  gap: 10px;
+}
+
+.finding-section h3,
+.inline-preview-panel h3 {
+  color: #111827;
+  font-size: 16px;
+  text-transform: uppercase;
+}
+
+.finding-card,
+.preview-comment {
+  display: grid;
+  gap: 9px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 12px;
+}
+
+.finding-card header {
+  display: grid;
+  gap: 4px;
+}
+
+.finding-card header strong,
+.preview-comment strong {
+  color: #111827;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.finding-card header span,
+.preview-comment span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.finding-card p,
+.inline-preview-panel p {
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.evidence-list {
+  display: grid;
+  gap: 6px;
+}
+
+.evidence-list code {
+  display: block;
+  border-radius: 6px;
+  background: #eef6f5;
+  color: #0f766e;
+  padding: 7px 8px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.suggestion-line {
+  border-left: 3px solid #0f766e;
+  padding-left: 10px;
+}
+
+.inline-preview-panel {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 14px;
+}
+
+.preview-summary {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.preview-summary span {
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #334155;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.preview-comment pre {
+  overflow: auto;
+  border-radius: 8px;
+  background: #121826;
+  color: #d1fae5;
+  padding: 12px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.preview-limitations {
+  margin: 0;
+  color: #9a3412;
+  font-size: 13px;
+}
+
+.compact-empty {
+  min-height: 54px;
+}
+
 .settings-grid,
 .template-panel,
 .docs-panel {
@@ -731,6 +1066,89 @@ h1 {
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.doctor-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.doctor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.doctor-header h3,
+.doctor-list h4 {
+  color: #111827;
+  font-size: 16px;
+}
+
+.doctor-status {
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.doctor-status.ok {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.doctor-status.failed {
+  background: #ffe4e6;
+  color: #be123c;
+}
+
+.doctor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.doctor-grid div {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 11px;
+}
+
+.doctor-grid span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.doctor-grid strong {
+  color: #111827;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.doctor-list {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 12px;
+}
+
+.doctor-list ul {
+  margin: 8px 0 0;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .info-card {
@@ -863,6 +1281,7 @@ h1 {
 
   .split-grid,
   .settings-grid,
+  .doctor-grid,
   .template-panel,
   .docs-panel {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -876,6 +1295,7 @@ h1 {
 
   .main-header,
   .report-toolbar,
+  .history-item,
   .selected-pr {
     align-items: stretch;
     flex-direction: column;
@@ -888,6 +1308,7 @@ h1 {
   .main-options,
   .toggle-grid,
   .action-row,
+  .history-filters,
   .settings-grid,
   .template-panel,
   .docs-panel,
@@ -901,5 +1322,18 @@ h1 {
 
   .result-output {
     min-height: 340px;
+  }
+
+  .structured-report,
+  .risk-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .wide-risk {
+    grid-column: auto;
+  }
+
+  .history-actions {
+    flex-direction: column;
   }
 }
