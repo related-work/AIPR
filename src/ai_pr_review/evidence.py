@@ -19,8 +19,13 @@ COMMENT_OR_DESCRIPTION_MARKERS = (
     "pr description",
     "功能描述",
     "review comment",
+    "review_comment",
     "issue comment",
+    "issue_comment",
+    "pull review",
+    "pull_review",
     "comment summary",
+    "comment_summary",
 )
 
 

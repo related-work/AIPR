@@ -49,6 +49,14 @@ def _report() -> ReviewReport:
                 reasons=["auth", "security_path"],
                 selected=True,
             ),
+            ChunkSummary(
+                path="src/ui.py",
+                old_start=1,
+                new_start=1,
+                score=0,
+                reasons=["default"],
+                selected=False,
+            ),
         ],
         test_suggestions=["增加无权限访问测试"],
         merge_recommendation="do_not_merge",
@@ -68,10 +76,11 @@ def test_render_markdown_contains_required_sections() -> None:
     assert "## 测试建议" in markdown
     assert "## 是否建议合并" in markdown
     assert "## 评论上下文" in markdown
+    assert "## Chunk 调试" in markdown
+    assert "src/auth/service.py:12" in markdown
+    assert "auth, security_path" in markdown
     assert "行内评论：6（Copilot 6）" in markdown
     assert "Review 总结：1（Copilot 1）" in markdown
-    assert "## Chunk 调试" in markdown
-    assert "auth, security_path" in markdown
     assert "## 分析限制" in markdown
     assert "src/auth/service.py:12" in markdown
 

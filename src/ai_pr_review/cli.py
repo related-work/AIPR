@@ -17,8 +17,15 @@ from ai_pr_review.config import (
 )
 from ai_pr_review.context import retrieve_context
 from ai_pr_review.diff_parser import build_chunks, parse_diff
+from ai_pr_review.doctor import (
+    DoctorReport,
+    render_doctor_json,
+    render_doctor_markdown,
+    run_doctor as run_doctor_report,
+)
 from ai_pr_review.evidence import verify_finding_evidence
 from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_pr_url
+from ai_pr_review.inline_comments import build_inline_review_comments
 from ai_pr_review.llm import analyze_chunks, select_models, verify_high_risk_findings
 from ai_pr_review.render import render_json, render_markdown
 from ai_pr_review.rules import run_rules
@@ -26,18 +33,38 @@ from ai_pr_review.schemas import ReviewReport
 
 
 Runner = Callable[..., ReviewReport]
+DoctorRunner = Callable[..., DoctorReport]
+WebRunner = Callable[..., int]
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
     runner: Runner | None = None,
+    doctor_runner: DoctorRunner | None = None,
+    web_runner: WebRunner | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+    if argv_list and argv_list[0] == "web":
+        return _main_web(
+            argv_list[1:],
+            web_runner=web_runner,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if argv_list and argv_list[0] == "doctor":
+        return _main_doctor(
+            argv_list[1:],
+            doctor_runner=doctor_runner,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
     parser = _build_parser()
     try:
-        args = parser.parse_args(list(argv) if argv is not None else None)
+        args = parser.parse_args(argv_list)
     except SystemExit as exc:
         return int(exc.code)
 
@@ -47,6 +74,7 @@ def main(
             pr_url=args.pr_url,
             output_format=args.output_format,
             post_comment=args.post_comment,
+            post_inline_comments=args.post_inline_comments,
             fail_on=args.fail_on,
             model_profile=args.model_profile,
             changed_only=args.changed_only,
@@ -64,11 +92,96 @@ def main(
     return 1 if should_fail_ci(report, args.fail_on) else 0
 
 
+def _main_doctor(
+    argv: Sequence[str],
+    *,
+    doctor_runner: DoctorRunner | None,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    parser = _build_doctor_parser()
+    try:
+        args = parser.parse_args(list(argv))
+    except SystemExit as exc:
+        return int(exc.code)
+    run = doctor_runner or run_doctor
+    try:
+        report = run(
+            output_format=args.output_format,
+            model_profile=args.model_profile,
+            smoke=not args.no_smoke,
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"错误：{exc}", file=stderr)
+        return 2
+    rendered = (
+        render_doctor_json(report)
+        if args.output_format == "json"
+        else render_doctor_markdown(report)
+    )
+    print(rendered, end="", file=stdout)
+    return 0 if report.ok else 2
+
+
+def _main_web(
+    argv: Sequence[str],
+    *,
+    web_runner: WebRunner | None,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    parser = _build_web_parser()
+    try:
+        args = parser.parse_args(list(argv))
+    except SystemExit as exc:
+        return int(exc.code)
+    run = web_runner or run_web
+    try:
+        return run(
+            host=args.host,
+            port=args.port,
+            frontend_dir=args.frontend_dir,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"错误：{exc}", file=stderr)
+        return 2
+
+
+def run_doctor(
+    *,
+    output_format: str,
+    model_profile: str,
+    smoke: bool,
+) -> DoctorReport:
+    config = load_config()
+    return run_doctor_report(
+        config=config,
+        github_token=resolve_github_token(config),
+        openai_api_key=resolve_openai_api_key(config),
+        openai_base_url=resolve_openai_base_url(config),
+        api_mode=resolve_openai_api_mode(config),
+        model_profile=model_profile,
+        smoke=smoke,
+    )
+
+
+def run_web(
+    *,
+    host: str,
+    port: int,
+    frontend_dir: str | None,
+) -> int:
+    from ai_pr_review.web import run_web_server
+
+    return run_web_server(host=host, port=port, frontend_dir=frontend_dir)
+
+
 def run_review(
     *,
     pr_url: str,
     output_format: str,
     post_comment: bool,
+    post_inline_comments: bool,
     fail_on: str | None,
     model_profile: str,
     changed_only: bool,
@@ -133,12 +246,12 @@ def run_review(
             context=context,
             comments_summary=comment_context.as_prompt_text(),
             model=fast_model,
+            comment_context=comment_context,
             api_key=openai_api_key,
             base_url=openai_base_url,
             api_mode=openai_api_mode,
             timeout_seconds=config.openai.timeout_seconds,
             max_chunks=None,
-            comment_context=comment_context,
             enabled=not no_llm,
         )
         limitations.extend(llm_limitations)
@@ -175,6 +288,15 @@ def run_review(
         if post_comment:
             rendered = render_json(report) if output_format == "json" else render_markdown(report)
             github.create_issue_comment(ref, rendered)
+        if post_inline_comments:
+            comments, inline_limitations = build_inline_review_comments(report.findings, diff_files)
+            report.limitations.extend(inline_limitations)
+            if comments:
+                github.create_pull_review(
+                    ref,
+                    body="AI PR Review inline comments",
+                    comments=comments,
+                )
         return report
     finally:
         github.close()
@@ -205,6 +327,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--post-comment",
         action="store_true",
         help="Post the rendered report as a GitHub PR comment",
+    )
+    parser.add_argument(
+        "--post-inline-comments",
+        action="store_true",
+        help="Post high-confidence blocking findings as GitHub inline review comments",
     )
     parser.add_argument(
         "--fail-on",
@@ -248,18 +375,60 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_doctor_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai-pr-review doctor",
+        description="Check local configuration and run a minimal LLM smoke test.",
+    )
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Doctor output format",
+    )
+    parser.add_argument(
+        "--model",
+        dest="model_profile",
+        choices=["fast", "balanced", "accurate"],
+        default="balanced",
+        help="Model profile for the smoke test",
+    )
+    parser.add_argument(
+        "--no-smoke",
+        action="store_true",
+        help="Skip the LLM smoke test and only inspect local configuration",
+    )
+    return parser
+
+
+def _build_web_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai-pr-review web",
+        description="Start the local Vue web UI and review runner API.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host address for the local web server",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port for the local web server",
+    )
+    parser.add_argument(
+        "--frontend-dir",
+        default=None,
+        help="Directory containing the built frontend assets",
+    )
+    return parser
+
+
 def _pr_summary(pr: dict, files: list[dict], commits: list[dict]) -> str:
     title = str(pr.get("title") or "未命名 PR")
     body = str(pr.get("body") or "").strip()
     file_count = len(files)
     commit_count = len(commits)
     return f"{title}\n文件数：{file_count}\ncommit 数：{commit_count}\n描述：{body[:500] or '无'}"
-
-
-def _comments_summary(comments: list[dict]) -> str:
-    bodies = []
-    for comment in comments[:10]:
-        body = str(comment.get("body") or "").strip()
-        if body:
-            bodies.append(body[:300])
-    return "\n---\n".join(bodies)

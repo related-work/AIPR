@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from pathlib import PurePosixPath
+import re
 from typing import Any
 
-from ai_pr_review.schemas import ChunkSummary, Finding, ReviewReport, RiskOverview, ScopeItem
-from ai_pr_review.schemas import CommentContext
+from ai_pr_review.schemas import (
+    ChunkSummary,
+    CommentContext,
+    Finding,
+    ReviewReport,
+    RiskOverview,
+    ScopeItem,
+)
 
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
@@ -107,7 +114,142 @@ def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
         current = best.get(key)
         if current is None or _score(finding) > _score(current):
             best[key] = finding
-    return list(best.values())
+    return _merge_near_duplicates(list(best.values()))
+
+
+def _merge_near_duplicates(findings: list[Finding]) -> list[Finding]:
+    merged: list[Finding] = []
+    for finding in findings:
+        for index, current in enumerate(merged):
+            if _is_near_duplicate(current, finding):
+                merged[index] = _merge_pair(current, finding)
+                break
+        else:
+            merged.append(finding)
+    return merged
+
+
+def _is_near_duplicate(left: Finding, right: Finding) -> bool:
+    if left.path != right.path or left.category != right.category:
+        return False
+    if _evidence_overlaps(left, right):
+        return True
+    if _same_security_theme(left, right):
+        return True
+    if left.line is not None and right.line is not None and left.line != right.line:
+        return False
+    left_tokens = _tokens(" ".join([left.problem, left.suggestion, *left.evidence]))
+    right_tokens = _tokens(" ".join([right.problem, right.suggestion, *right.evidence]))
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = len(left_tokens & right_tokens)
+    return overlap >= 3 and overlap / min(len(left_tokens), len(right_tokens)) >= 0.35
+
+
+def _same_security_theme(left: Finding, right: Finding) -> bool:
+    if left.category != "security":
+        return False
+    left_text = " ".join([left.problem, left.suggestion, *left.evidence]).lower()
+    right_text = " ".join([right.problem, right.suggestion, *right.evidence]).lower()
+    themes = (
+        ("sql", "select", "注入", "参数化", "f-string"),
+        ("require_admin", "auth", "鉴权", "权限", "admin/audit-log"),
+    )
+    for theme in themes:
+        if any(token in left_text for token in theme) and any(token in right_text for token in theme):
+            return True
+    return False
+
+
+def _evidence_overlaps(left: Finding, right: Finding) -> bool:
+    left_fragments = [_normalize_evidence(item) for item in left.evidence]
+    right_fragments = [_normalize_evidence(item) for item in right.evidence]
+    for left_item in left_fragments:
+        for right_item in right_fragments:
+            if len(left_item) < 12 or len(right_item) < 12:
+                continue
+            if left_item in right_item or right_item in left_item:
+                return True
+            if len(_tokens(left_item) & _tokens(right_item)) >= 4:
+                return True
+    return False
+
+
+def _merge_pair(left: Finding, right: Finding) -> Finding:
+    precise = _prefer_precise_location(left, right)
+    severe = _prefer_higher_severity(left, right)
+    informative = _prefer_informative_text(left, right)
+    source = "rule" if left.source == "rule" or right.source == "rule" else severe.source
+    rule_id = left.rule_id or right.rule_id
+    return precise.model_copy(
+        update={
+            "severity": severe.severity,
+            "confidence": max(left.confidence, right.confidence),
+            "evidence": _unique_evidence([*left.evidence, *right.evidence]),
+            "problem": informative.problem,
+            "suggestion": informative.suggestion,
+            "blocking": left.blocking or right.blocking,
+            "source": source,
+            "rule_id": rule_id,
+        }
+    )
+
+
+def _prefer_precise_location(left: Finding, right: Finding) -> Finding:
+    if left.line is not None and right.line is None:
+        return left
+    if right.line is not None and left.line is None:
+        return right
+    if left.source == "rule" and right.source != "rule":
+        return left
+    if right.source == "rule" and left.source != "rule":
+        return right
+    return _prefer_higher_severity(left, right)
+
+
+def _prefer_higher_severity(left: Finding, right: Finding) -> Finding:
+    if SEVERITY_RANK[left.severity] != SEVERITY_RANK[right.severity]:
+        return left if SEVERITY_RANK[left.severity] > SEVERITY_RANK[right.severity] else right
+    if left.confidence != right.confidence:
+        return left if left.confidence > right.confidence else right
+    return left if _score(left) >= _score(right) else right
+
+
+def _prefer_informative_text(left: Finding, right: Finding) -> Finding:
+    left_len = len(left.problem) + len(left.suggestion)
+    right_len = len(right.problem) + len(right.suggestion)
+    if left_len != right_len:
+        return left if left_len > right_len else right
+    return _prefer_higher_severity(left, right)
+
+
+def _normalize_evidence(value: str) -> str:
+    return " ".join(value.replace("+", " ").replace("-", " ").split()).lower()
+
+
+def _tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*|[\u4e00-\u9fff]{2,}", value.lower())
+        if token not in {"the", "and", "for", "with", "from", "this", "that", "return"}
+    }
+
+
+def _unique_evidence(items: list[str]) -> list[str]:
+    result: list[str] = []
+    normalized_items: list[str] = []
+    for item in items:
+        normalized = _normalize_evidence(item)
+        if any(
+            normalized == existing
+            or (len(normalized) >= 12 and normalized in existing)
+            or (len(existing) >= 12 and existing in normalized)
+            for existing in normalized_items
+        ):
+            continue
+        normalized_items.append(normalized)
+        result.append(item)
+    return result
 
 
 def _score(finding: Finding) -> tuple[int, float, int]:
