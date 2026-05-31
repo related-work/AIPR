@@ -1,10 +1,12 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
-import { FileText, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
+import { Activity, FileText, History, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
 
 import AppShell from "./components/AppShell.vue";
 import CommandModal from "./components/CommandModal.vue";
 import HelpPanel from "./components/HelpPanel.vue";
+import HistoryPanel from "./components/HistoryPanel.vue";
+import QualityEvalPanel from "./components/QualityEvalPanel.vue";
 import RepoBrowser from "./components/RepoBrowser.vue";
 import ReportViewer from "./components/ReportViewer.vue";
 import ReviewRunner from "./components/ReviewRunner.vue";
@@ -44,12 +46,37 @@ const showCommand = ref(false);
 const copied = ref(false);
 const job = ref(null);
 const runError = ref("");
+const historyJobs = ref([]);
+const historyError = ref("");
+const loadingHistory = ref(false);
 const pollingTimer = ref(null);
+const qualityEvaluation = ref(null);
+const qualityError = ref("");
+const loadingQuality = ref(false);
+const qualityFixture = ref("all");
+const qualitySnapshots = ref([]);
+const qualitySnapshotError = ref("");
+const loadingQualitySnapshots = ref(false);
+const savingQualitySnapshot = ref(false);
+const qualitySnapshotLabel = ref("");
+const qualityCompareBase = ref("");
+const qualityCompareTarget = ref("");
+const qualityComparison = ref(null);
+const qualityComparisonError = ref("");
+const historyFilters = reactive({
+  query: "",
+  status: "",
+  repo: "",
+  from: "",
+  to: ""
+});
 
 const navItems = [
   { id: "browse", label: "PR 浏览", icon: SearchCode },
   { id: "review", label: "Review 运行", icon: Play },
   { id: "report", label: "报告结果", icon: FileText },
+  { id: "history", label: "历史记录", icon: History },
+  { id: "quality", label: "质量评测", icon: Activity },
   { id: "settings", label: "本地配置", icon: ShieldCheck },
   { id: "help", label: "帮助", icon: Settings2 }
 ];
@@ -295,6 +322,20 @@ function requestPayload() {
   };
 }
 
+function applyRequest(request) {
+  form.prUrl = request.prUrl || form.prUrl;
+  form.format = request.format || form.format;
+  form.model = request.model || form.model;
+  form.failOn = request.failOn || "";
+  form.postComment = Boolean(request.postComment);
+  form.postInlineComments = Boolean(request.postInlineComments);
+  form.changedOnly = Boolean(request.changedOnly);
+  form.withContext = Boolean(request.withContext);
+  form.noLlm = Boolean(request.noLlm);
+  form.llmMaxChunks = request.llmMaxChunks || form.llmMaxChunks;
+  form.debugChunks = Boolean(request.debugChunks);
+}
+
 async function runReview() {
   if (urlError.value || isRunning.value) {
     return;
@@ -319,6 +360,225 @@ async function runReview() {
   }
 }
 
+async function loadHistory() {
+  historyError.value = "";
+  loadingHistory.value = true;
+  try {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(historyFilters)) {
+      if (value) {
+        params.set(key, value);
+      }
+    }
+    const queryString = params.toString();
+    const response = await fetch(`/api/reviews${queryString ? `?${queryString}` : ""}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取历史失败");
+    }
+    historyJobs.value = payload.jobs || [];
+  } catch (error) {
+    historyError.value = error.message;
+  } finally {
+    loadingHistory.value = false;
+  }
+}
+
+async function deleteHistoryJob(historyJob) {
+  if (!window.confirm(`删除这条 Review 历史？\n${historyJob.request.prUrl}`)) {
+    return;
+  }
+  historyError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${encodeURIComponent(historyJob.id)}`, {
+      method: "DELETE"
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "删除历史失败");
+    }
+    if (job.value?.id === historyJob.id) {
+      job.value = null;
+    }
+    await loadHistory();
+  } catch (error) {
+    historyError.value = error.message;
+  }
+}
+
+async function clearHistory() {
+  if (!window.confirm("清空所有已完成的 Review 历史？运行中的任务会保留。")) {
+    return;
+  }
+  historyError.value = "";
+  try {
+    const response = await fetch("/api/reviews", { method: "DELETE" });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "清空历史失败");
+    }
+    await loadHistory();
+  } catch (error) {
+    historyError.value = error.message;
+  }
+}
+
+function exportHistoryJob(historyJob, format) {
+  const extension = format === "json" ? "json" : "md";
+  const link = document.createElement("a");
+  link.href = `/api/reviews/${encodeURIComponent(historyJob.id)}/export?format=${encodeURIComponent(format)}`;
+  link.download = `ai-pr-review-${historyJob.id}.${extension}`;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function updateHistoryFilter({ key, value }) {
+  if (Object.prototype.hasOwnProperty.call(historyFilters, key)) {
+    historyFilters[key] = value;
+  }
+}
+
+async function runQualityEvaluation() {
+  if (loadingQuality.value) {
+    return;
+  }
+  qualityError.value = "";
+  loadingQuality.value = true;
+  try {
+    const response = await fetch(`/api/quality-evaluation?fixture=${encodeURIComponent(qualityFixture.value)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "运行质量评测失败");
+    }
+    qualityEvaluation.value = payload;
+  } catch (error) {
+    qualityError.value = error.message;
+  } finally {
+    loadingQuality.value = false;
+  }
+}
+
+async function loadQualitySnapshots() {
+  qualitySnapshotError.value = "";
+  loadingQualitySnapshots.value = true;
+  try {
+    const response = await fetch("/api/quality-evaluation/snapshots");
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取评测快照失败");
+    }
+    qualitySnapshots.value = payload.snapshots || [];
+    if (!qualityCompareTarget.value && qualitySnapshots.value[0]) {
+      qualityCompareTarget.value = qualitySnapshots.value[0].id;
+    }
+    if (!qualityCompareBase.value && qualitySnapshots.value[1]) {
+      qualityCompareBase.value = qualitySnapshots.value[1].id;
+    }
+  } catch (error) {
+    qualitySnapshotError.value = error.message;
+  } finally {
+    loadingQualitySnapshots.value = false;
+  }
+}
+
+async function saveQualitySnapshot() {
+  if (savingQualitySnapshot.value) {
+    return;
+  }
+  qualitySnapshotError.value = "";
+  savingQualitySnapshot.value = true;
+  try {
+    const response = await fetch("/api/quality-evaluation/snapshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fixture: qualityFixture.value,
+        label: qualitySnapshotLabel.value || null
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "保存评测快照失败");
+    }
+    qualitySnapshotLabel.value = "";
+    await loadQualitySnapshots();
+    qualityCompareTarget.value = payload.id;
+  } catch (error) {
+    qualitySnapshotError.value = error.message;
+  } finally {
+    savingQualitySnapshot.value = false;
+  }
+}
+
+async function compareQualitySnapshots() {
+  if (!qualityCompareBase.value || !qualityCompareTarget.value) {
+    qualityComparisonError.value = "请选择两个快照";
+    return;
+  }
+  qualityComparisonError.value = "";
+  try {
+    const response = await fetch(
+      `/api/quality-evaluation/snapshots/compare?base=${encodeURIComponent(
+        qualityCompareBase.value
+      )}&target=${encodeURIComponent(qualityCompareTarget.value)}`
+    );
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "比较评测快照失败");
+    }
+    qualityComparison.value = payload;
+  } catch (error) {
+    qualityComparisonError.value = error.message;
+  }
+}
+
+function updateQualitySnapshotLabel(value) {
+  qualitySnapshotLabel.value = value;
+}
+
+function updateQualityCompareBase(value) {
+  qualityCompareBase.value = value;
+}
+
+function updateQualityCompareTarget(value) {
+  qualityCompareTarget.value = value;
+}
+
+async function viewHistoryJob(historyJob) {
+  historyError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${historyJob.id}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取历史报告失败");
+    }
+    job.value = payload;
+    activeView.value = "report";
+  } catch (error) {
+    historyError.value = error.message;
+  }
+}
+
+function rerunHistoryJob(historyJob) {
+  applyRequest(historyJob.request);
+  activeView.value = "review";
+}
+
+function navigate(view) {
+  activeView.value = view;
+  if (view === "history") {
+    loadHistory();
+  }
+  if (view === "quality" && !qualityEvaluation.value) {
+    runQualityEvaluation();
+  }
+  if (view === "quality" && !qualitySnapshots.value.length) {
+    loadQualitySnapshots();
+  }
+}
+
 function pollJob(jobId) {
   window.clearInterval(pollingTimer.value);
   pollingTimer.value = window.setInterval(async () => {
@@ -331,6 +591,7 @@ function pollJob(jobId) {
       job.value = payload;
       if (!["queued", "running"].includes(payload.status)) {
         window.clearInterval(pollingTimer.value);
+        loadHistory();
       }
     } catch (error) {
       runError.value = error.message;
@@ -350,7 +611,7 @@ onBeforeUnmount(() => {
     :is-running="isRunning"
     :nav-items="navItems"
     :selected-pr-label="selectedPrLabel"
-    @navigate="activeView = $event"
+    @navigate="navigate"
     @open-command="showCommand = true"
   >
     <RepoBrowser
@@ -392,6 +653,45 @@ onBeforeUnmount(() => {
       :output-text="outputText"
       :run-error="runError"
       @go-runner="activeView = 'review'"
+    />
+
+    <HistoryPanel
+      v-else-if="activeView === 'history'"
+      :history-filters="historyFilters"
+      :history-error="historyError"
+      :history-jobs="historyJobs"
+      :loading-history="loadingHistory"
+      @clear="clearHistory"
+      @delete-job="deleteHistoryJob"
+      @export-job="exportHistoryJob"
+      @refresh="loadHistory"
+      @rerun-job="rerunHistoryJob"
+      @update-filter="updateHistoryFilter"
+      @view-job="viewHistoryJob"
+    />
+
+    <QualityEvalPanel
+      v-else-if="activeView === 'quality'"
+      v-model:fixture="qualityFixture"
+      :comparison="qualityComparison"
+      :comparison-error="qualityComparisonError"
+      :compare-base="qualityCompareBase"
+      :compare-target="qualityCompareTarget"
+      :evaluation="qualityEvaluation"
+      :evaluation-error="qualityError"
+      :loading-evaluation="loadingQuality"
+      :loading-snapshots="loadingQualitySnapshots"
+      :saving-snapshot="savingQualitySnapshot"
+      :snapshot-error="qualitySnapshotError"
+      :snapshot-label="qualitySnapshotLabel"
+      :snapshots="qualitySnapshots"
+      @compare-snapshots="compareQualitySnapshots"
+      @refresh-snapshots="loadQualitySnapshots"
+      @run="runQualityEvaluation"
+      @save-snapshot="saveQualitySnapshot"
+      @update:compare-base="updateQualityCompareBase"
+      @update:compare-target="updateQualityCompareTarget"
+      @update:snapshot-label="updateQualitySnapshotLabel"
     />
 
     <SettingsPanel

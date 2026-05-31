@@ -22,6 +22,8 @@ ai-pr-review https://github.com/org/repo/pull/123 --no-llm
 ai-pr-review https://github.com/org/repo/pull/123 --llm-max-chunks 2
 ai-pr-review https://github.com/org/repo/pull/123 --post-comment
 ai-pr-review https://github.com/org/repo/pull/123 --post-inline-comments
+ai-pr-review eval
+ai-pr-review eval --format json
 ```
 
 Default behavior prints a report to the terminal and does not write back to GitHub. `--post-comment` is required to create a PR summary comment. `--post-inline-comments` creates GitHub inline review comments only for high/critical, blocking, high-confidence findings that can be mapped to newly added diff lines.
@@ -45,10 +47,15 @@ The page supports two workflows:
 - Generate a copyable CLI command from PR URL and options.
 - Run the review through the local Python API and view the report in the browser.
 - Enter a GitHub user or organization, load repositories, select a repository, and auto-fill an open PR.
+- View recent review runs in the History view, reopen reports, and rerun with the same options.
+- Run local quality evaluation fixtures from the Quality view.
+- Save quality evaluation snapshots and compare later runs against a baseline.
 
 The browser never receives `GITHUB_TOKEN`, `OPENAI_API_KEY`, or local config secrets. The local Python process reads credentials from environment variables or `.ai-pr-review.local.yml`, then runs the same CLI review path used by the terminal command.
 
 GitHub browsing uses the same local GitHub token resolution as the CLI. Public repositories can be browsed without a token, but GitHub applies stricter anonymous rate limits.
+
+Review history is persisted locally under `.ai-pr-review/runs/` and is ignored by git. These files can contain PR URLs, report output, and code snippets from analyzed diffs, so treat the directory as private local data.
 
 Useful web server options:
 
@@ -147,6 +154,20 @@ review:
 ai-pr-review PR_URL --no-llm
 ai-pr-review PR_URL --llm-max-chunks 2
 ```
+
+## Quality Evaluation
+
+Run deterministic local quality fixtures after changing rules, aggregation, prompts, or model settings:
+
+```bash
+ai-pr-review eval
+ai-pr-review eval --format json
+ai-pr-review eval --fixture harmful_pr
+```
+
+The evaluation set is network-free. It runs fixed PR diffs for high-quality, low-quality, harmful, and clean changes through the rule engine and aggregation path, then reports false positives and false negatives.
+
+The local web console can persist evaluation snapshots under `.ai-pr-review/quality-eval/` and compare two snapshots to show changes in pass count, false positives, false negatives, and fixture-level rule hits.
 
 For slow OpenAI-compatible gateways, prefer:
 
