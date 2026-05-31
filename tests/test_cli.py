@@ -171,6 +171,24 @@ def test_cli_web_subcommand_invokes_web_runner() -> None:
     ]
 
 
+def test_cli_eval_subcommand_renders_json_and_returns_success() -> None:
+    stdout = io.StringIO()
+
+    exit_code = cli.main(
+        ["eval", "--format", "json"],
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    payload = json.loads(stdout.getvalue())
+
+    assert exit_code == 0
+    assert payload["total"] == 4
+    assert payload["passed"] == 4
+    assert payload["falsePositives"] == 0
+    assert payload["falseNegatives"] == 0
+
+
 def test_run_review_includes_pull_reviews_in_comment_context(monkeypatch) -> None:
     class FakeGitHub:
         def __init__(self, token=None):

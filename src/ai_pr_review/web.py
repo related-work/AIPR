@@ -31,6 +31,7 @@ from ai_pr_review.doctor import SmokeTester, run_doctor as run_doctor_report
 from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_pr_url
 from ai_pr_review.inline_comments import build_inline_review_comments
 from ai_pr_review.progress import PROGRESS_FILE_ENV, ProgressEvent, ProgressStatus, read_progress_events
+from ai_pr_review.quality_eval import QualitySnapshotStore, evaluate_builtin_fixtures
 from ai_pr_review.schemas import Finding
 
 
@@ -250,6 +251,36 @@ def doctor_payload(
         "warnings": report.warnings,
         "limitations": report.limitations,
     }
+
+
+def quality_evaluation_payload(fixture_id: str = "all") -> dict:
+    report = evaluate_builtin_fixtures(fixture_id=fixture_id or "all")
+    return report.model_dump(by_alias=True, mode="json")
+
+
+def quality_snapshot_save_payload(
+    store: QualitySnapshotStore,
+    *,
+    fixture_id: str,
+    label: str | None = None,
+) -> dict:
+    report = evaluate_builtin_fixtures(fixture_id=fixture_id or "all")
+    snapshot = store.save(report, label=label)
+    return snapshot.model_dump(by_alias=True, mode="json")
+
+
+def quality_snapshot_list_payload(store: QualitySnapshotStore) -> dict:
+    return {"snapshots": store.list_summaries()}
+
+
+def quality_snapshot_compare_payload(
+    store: QualitySnapshotStore,
+    *,
+    base_id: str,
+    target_id: str,
+) -> dict:
+    comparison = store.compare(base_id, target_id)
+    return comparison.model_dump(by_alias=True, mode="json")
 
 
 def _now() -> str:
@@ -575,6 +606,7 @@ class ReviewJobStore:
 def create_handler(
     *,
     store: ReviewJobStore,
+    quality_store: QualitySnapshotStore,
     frontend_dir: Path,
 ) -> type[BaseHTTPRequestHandler]:
     static_root = frontend_dir.resolve()
@@ -594,6 +626,15 @@ def create_handler(
                 return
             if path == "/api/doctor":
                 self._handle_doctor()
+                return
+            if path == "/api/quality-evaluation":
+                self._handle_quality_evaluation()
+                return
+            if path == "/api/quality-evaluation/snapshots":
+                self._send_json(quality_snapshot_list_payload(quality_store))
+                return
+            if path == "/api/quality-evaluation/snapshots/compare":
+                self._handle_quality_snapshot_compare()
                 return
             if path == "/api/reviews":
                 self._handle_review_list()
@@ -632,6 +673,9 @@ def create_handler(
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            if path == "/api/quality-evaluation/snapshots":
+                self._handle_quality_snapshot_save()
+                return
             if path != "/api/reviews":
                 self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -752,6 +796,53 @@ def create_handler(
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(payload)
+
+        def _handle_quality_evaluation(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            fixture_id = (query.get("fixture") or ["all"])[0].strip() or "all"
+            try:
+                self._send_json(quality_evaluation_payload(fixture_id))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+        def _handle_quality_snapshot_save(self) -> None:
+            try:
+                payload = self._read_json()
+                fixture_id = str(payload.get("fixture") or "all")
+                label = payload.get("label")
+                if label is not None:
+                    label = str(label)
+                self._send_json(
+                    quality_snapshot_save_payload(
+                        quality_store,
+                        fixture_id=fixture_id,
+                        label=label,
+                    ),
+                    status=HTTPStatus.CREATED,
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+        def _handle_quality_snapshot_compare(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            base_id = (query.get("base") or [""])[0].strip()
+            target_id = (query.get("target") or [""])[0].strip()
+            if not base_id or not target_id:
+                self._send_json(
+                    {"error": "base 和 target 快照不能为空"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                self._send_json(
+                    quality_snapshot_compare_payload(
+                        quality_store,
+                        base_id=base_id,
+                        target_id=target_id,
+                    )
+                )
+            except KeyError:
+                self._send_json({"error": "quality snapshot not found"}, status=HTTPStatus.NOT_FOUND)
 
         def _handle_github_repos(self) -> None:
             query = parse_qs(urlparse(self.path).query)
@@ -888,7 +979,8 @@ def run_web_server(
     root = Path(__file__).resolve().parents[2]
     static_dir = Path(frontend_dir) if frontend_dir else root / "frontend" / "dist"
     store = ReviewJobStore(cwd=root, storage_dir=root / ".ai-pr-review" / "runs")
-    handler = create_handler(store=store, frontend_dir=static_dir)
+    quality_store = QualitySnapshotStore(root / ".ai-pr-review" / "quality-eval")
+    handler = create_handler(store=store, quality_store=quality_store, frontend_dir=static_dir)
     server = ThreadingHTTPServer((host, port), handler)
     print(f"AI PR Review Web 正在运行：http://{host}:{port}")
     print("按 Ctrl+C 停止。")

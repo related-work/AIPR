@@ -108,9 +108,14 @@ def _calibrate_blocking(finding: Finding) -> Finding:
 
 
 def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
-    best: dict[tuple[str, int | None, str], Finding] = {}
+    best: dict[tuple[str, int | None, str, str | None], Finding] = {}
     for finding in findings:
-        key = (finding.path, finding.line, finding.category)
+        key = (
+            finding.path,
+            finding.line,
+            finding.category,
+            finding.rule_id if finding.source == "rule" else None,
+        )
         current = best.get(key)
         if current is None or _score(finding) > _score(current):
             best[key] = finding

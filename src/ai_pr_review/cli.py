@@ -28,6 +28,12 @@ from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_
 from ai_pr_review.inline_comments import build_inline_review_comments
 from ai_pr_review.llm import analyze_chunks, select_models, verify_high_risk_findings
 from ai_pr_review.progress import ProgressReporter
+from ai_pr_review.quality_eval import (
+    QualityEvaluationReport,
+    evaluate_builtin_fixtures,
+    render_quality_evaluation_json,
+    render_quality_evaluation_markdown,
+)
 from ai_pr_review.render import render_json, render_markdown
 from ai_pr_review.rules import run_rules
 from ai_pr_review.schemas import ReviewReport
@@ -36,6 +42,7 @@ from ai_pr_review.schemas import ReviewReport
 Runner = Callable[..., ReviewReport]
 DoctorRunner = Callable[..., DoctorReport]
 WebRunner = Callable[..., int]
+EvalRunner = Callable[..., QualityEvaluationReport]
 
 
 def main(
@@ -44,6 +51,7 @@ def main(
     runner: Runner | None = None,
     doctor_runner: DoctorRunner | None = None,
     web_runner: WebRunner | None = None,
+    eval_runner: EvalRunner | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
@@ -52,6 +60,13 @@ def main(
         return _main_web(
             argv_list[1:],
             web_runner=web_runner,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if argv_list and argv_list[0] == "eval":
+        return _main_eval(
+            argv_list[1:],
+            eval_runner=eval_runner,
             stdout=stdout,
             stderr=stderr,
         )
@@ -124,6 +139,33 @@ def _main_doctor(
     return 0 if report.ok else 2
 
 
+def _main_eval(
+    argv: Sequence[str],
+    *,
+    eval_runner: EvalRunner | None,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    parser = _build_eval_parser()
+    try:
+        args = parser.parse_args(list(argv))
+    except SystemExit as exc:
+        return int(exc.code)
+    run = eval_runner or run_quality_eval
+    try:
+        report = run(fixture_id=args.fixture_id)
+    except ValueError as exc:
+        print(f"错误：{exc}", file=stderr)
+        return 2
+    rendered = (
+        render_quality_evaluation_json(report)
+        if args.output_format == "json"
+        else render_quality_evaluation_markdown(report)
+    )
+    print(rendered, end="", file=stdout)
+    return 0 if report.failed == 0 else 1
+
+
 def _main_web(
     argv: Sequence[str],
     *,
@@ -175,6 +217,10 @@ def run_web(
     from ai_pr_review.web import run_web_server
 
     return run_web_server(host=host, port=port, frontend_dir=frontend_dir)
+
+
+def run_quality_eval(*, fixture_id: str) -> QualityEvaluationReport:
+    return evaluate_builtin_fixtures(fixture_id=fixture_id)
 
 
 def run_review(
@@ -448,6 +494,27 @@ def _build_doctor_parser() -> argparse.ArgumentParser:
         "--no-smoke",
         action="store_true",
         help="Skip the LLM smoke test and only inspect local configuration",
+    )
+    return parser
+
+
+def _build_eval_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai-pr-review eval",
+        description="Run deterministic local review-quality fixtures without network calls.",
+    )
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Evaluation output format",
+    )
+    parser.add_argument(
+        "--fixture",
+        dest="fixture_id",
+        default="all",
+        help="Fixture id to run, or all",
     )
     return parser
 
