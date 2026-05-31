@@ -14,6 +14,7 @@ defineProps({
 const emit = defineEmits([
   "clear-selection",
   "go-browse",
+  "open-batch-reports",
   "open-report",
   "run",
   "select-all",
@@ -77,7 +78,17 @@ const emit = defineEmits([
           <strong>批量任务</strong>
           <span>{{ batchJob.completed }} / {{ batchJob.total }} 完成 · {{ batchJob.failed }} 失败</span>
         </div>
-        <span :class="['history-status', batchJob.status]">{{ batchJob.status }}</span>
+        <div class="batch-actions">
+          <button
+            class="ghost-button"
+            type="button"
+            :disabled="!batchJob.items?.some((item) => item.jobId)"
+            @click="emit('open-batch-reports')"
+          >
+            查看全部报告
+          </button>
+          <span :class="['history-status', batchJob.status]">{{ batchJob.status }}</span>
+        </div>
       </div>
 
       <div class="batch-result-list">

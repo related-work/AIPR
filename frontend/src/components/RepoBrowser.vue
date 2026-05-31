@@ -11,14 +11,19 @@ defineProps({
   selectedPull: { type: Object, default: null },
   browseError: { type: String, default: "" },
   loadingRepos: { type: Boolean, default: false },
-  loadingPulls: { type: Boolean, default: false }
+  loadingPulls: { type: Boolean, default: false },
+  selectedUrls: { type: Array, required: true }
 });
 
 const emit = defineEmits([
   "load-repositories",
   "load-pulls",
   "apply-selected-pull",
+  "clear-selection",
   "proceed-review",
+  "proceed-batch",
+  "select-all",
+  "toggle-pull",
   "update:repo-filter"
 ]);
 </script>
@@ -96,7 +101,7 @@ const emit = defineEmits([
         <div class="panel-heading compact-heading">
           <div>
             <h3>Pull Requests</h3>
-            <p>{{ selectedRepo?.fullName || "选择仓库" }}</p>
+            <p>{{ selectedRepo?.fullName || "选择仓库" }} · 已选 {{ selectedUrls.length }} / {{ pulls.length }}</p>
           </div>
           <select v-model="explorer.state" class="small-select" @change="emit('load-pulls')">
             <option value="open">Open</option>
@@ -105,32 +110,64 @@ const emit = defineEmits([
           </select>
         </div>
 
-        <div v-if="loadingPulls" class="empty-state">正在读取 PR...</div>
-        <div v-else-if="!pulls.length" class="empty-state">没有可选 PR</div>
-        <div v-else class="pull-list">
+        <div class="batch-actions browse-selection-actions">
+          <button class="ghost-button" type="button" :disabled="!pulls.length" @click="emit('select-all')">全选</button>
+          <button class="ghost-button" type="button" :disabled="!selectedUrls.length" @click="emit('clear-selection')">清空</button>
           <button
-            v-for="pull in pulls"
-            :key="pull.url"
-            :class="{ active: explorer.pullUrl === pull.url }"
+            class="secondary-wide-button"
             type="button"
-            @click="
-              explorer.pullUrl = pull.url;
-              emit('apply-selected-pull');
-            "
+            :disabled="!selectedUrls.length"
+            @click="emit('proceed-batch')"
           >
-            <strong>#{{ pull.number }} {{ pull.title }}</strong>
-            <span>{{ pull.author }} · {{ pull.updatedAt }}</span>
+            批量审核已选
           </button>
         </div>
 
-        <button
-          class="primary-button"
-          type="button"
-          :disabled="!selectedPull"
-          @click="emit('proceed-review')"
-        >
-          选择并进入 Review
-        </button>
+        <div v-if="loadingPulls" class="empty-state">正在读取 PR...</div>
+        <div v-else-if="!pulls.length" class="empty-state">没有可选 PR</div>
+        <div v-else class="pull-list">
+          <article
+            v-for="pull in pulls"
+            :key="pull.url"
+            :class="['pull-row', { active: explorer.pullUrl === pull.url, selected: selectedUrls.includes(pull.url) }]"
+          >
+            <input
+              type="checkbox"
+              :checked="selectedUrls.includes(pull.url)"
+              :aria-label="`选择 PR #${pull.number}`"
+              @change="emit('toggle-pull', pull.url)"
+            />
+            <button
+              type="button"
+              @click="
+                explorer.pullUrl = pull.url;
+                emit('apply-selected-pull');
+              "
+            >
+              <strong>#{{ pull.number }} {{ pull.title }}</strong>
+              <span>{{ pull.author }} · {{ pull.updatedAt }}</span>
+            </button>
+          </article>
+        </div>
+
+        <div class="action-row">
+          <button
+            class="primary-button"
+            type="button"
+            :disabled="!selectedPull"
+            @click="emit('proceed-review')"
+          >
+            选择并进入 Review
+          </button>
+          <button
+            class="secondary-wide-button"
+            type="button"
+            :disabled="!selectedUrls.length"
+            @click="emit('proceed-batch')"
+          >
+            批量 Review
+          </button>
+        </div>
       </div>
     </section>
   </section>

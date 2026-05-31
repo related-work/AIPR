@@ -38,8 +38,11 @@ from ai_pr_review.schemas import Finding
 
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 BatchItemStatus = Literal["pending", "running", "succeeded", "failed", "skipped"]
+WatcherStatus = Literal["paused", "running", "failed"]
 RiskLevel = Literal["critical", "high", "medium", "low", "unknown"]
 Executor = Callable[[list[str], Path, dict[str, str]], subprocess.CompletedProcess[str]]
+ReviewStarter = Callable[[object], object]
+GitHubFactory = Callable[[], object]
 OWNER_REPO_PATTERN = r"^[A-Za-z0-9_.-]+$"
 
 
@@ -134,6 +137,58 @@ class BatchReviewJob(BaseModel):
     completed: int = 0
     failed: int = 0
     items: list[BatchReviewItem]
+
+
+class WatcherRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    repo: str
+    state: Literal["open", "all"] = "open"
+    interval_seconds: int = Field(default=300, ge=10, le=86_400, alias="intervalSeconds")
+    include_drafts: bool = Field(default=False, alias="includeDrafts")
+    model_profile: Literal["fast", "balanced", "accurate"] = Field(default="fast", alias="model")
+    changed_only: bool = Field(default=True, alias="changedOnly")
+    with_context: bool = Field(default=False, alias="withContext")
+    no_llm: bool = Field(default=False, alias="noLlm")
+    llm_max_chunks: int | None = Field(default=2, ge=1, le=50, alias="llmMaxChunks")
+    max_files: int | None = Field(default=80, ge=1, le=500, alias="maxFiles")
+    max_chunks: int | None = Field(default=40, ge=1, le=1000, alias="maxChunks")
+    max_context_files: int | None = Field(default=20, ge=1, le=200, alias="maxContextFiles")
+    max_patch_lines_per_chunk: int | None = Field(default=400, ge=20, le=2000, alias="maxPatchLinesPerChunk")
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def validate_owner_repo(cls, value: str) -> str:
+        if not _valid_owner_or_repo(value):
+            raise ValueError("owner/repo 只能包含 GitHub 仓库名允许的字符")
+        return value
+
+
+class WatcherTriggeredReview(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    pr_number: int = Field(alias="prNumber")
+    pr_url: str = Field(alias="prUrl")
+    title: str = ""
+    head_sha: str = Field(alias="headSha")
+    job_id: str | None = Field(default=None, alias="jobId")
+    triggered_at: str = Field(alias="triggeredAt")
+
+
+class WatcherJob(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    status: WatcherStatus = "paused"
+    request: WatcherRunRequest
+    created_at: str = Field(alias="createdAt")
+    started_at: str | None = Field(default=None, alias="startedAt")
+    last_checked_at: str | None = Field(default=None, alias="lastCheckedAt")
+    last_error: str | None = Field(default=None, alias="lastError")
+    triggered: int = 0
+    seen_heads: dict[int, str] = Field(default_factory=dict, alias="seenHeads")
+    recent_reviews: list[WatcherTriggeredReview] = Field(default_factory=list, alias="recentReviews")
 
 
 def build_cli_args(request: ReviewRunRequest) -> list[str]:
@@ -270,6 +325,116 @@ def _finding_for_comment(findings: list[Finding], comment: dict) -> Finding:
         if finding.path == comment["path"] and finding.line == comment["line"]:
             return finding
     raise ValueError("inline comment does not match a finding")
+
+
+def diff_preview_payload(raw_diff: str, report_output: str = "") -> dict:
+    diff_files = parse_diff(raw_diff)
+    findings_by_location = _findings_by_location(report_output)
+    files = []
+    total_additions = 0
+    total_deletions = 0
+    findings_mapped = 0
+
+    for diff_file in diff_files:
+        file_additions = 0
+        file_deletions = 0
+        hunks = []
+        for hunk in diff_file.hunks:
+            lines = []
+            for line in hunk.lines:
+                if line.kind == "add":
+                    file_additions += 1
+                    total_additions += 1
+                elif line.kind == "remove":
+                    file_deletions += 1
+                    total_deletions += 1
+                line_findings = _line_findings(
+                    findings_by_location,
+                    diff_file.path,
+                    line.new_line_no,
+                )
+                findings_mapped += len(line_findings)
+                lines.append(
+                    {
+                        "kind": line.kind,
+                        "content": line.content,
+                        "oldLine": line.old_line_no,
+                        "newLine": line.new_line_no,
+                        "findings": line_findings,
+                    }
+                )
+            hunks.append(
+                {
+                    "oldStart": hunk.old_start,
+                    "oldLength": hunk.old_length,
+                    "newStart": hunk.new_start,
+                    "newLength": hunk.new_length,
+                    "sectionHeader": hunk.section_header,
+                    "lines": lines,
+                }
+            )
+        files.append(
+            {
+                "path": diff_file.path,
+                "oldPath": diff_file.old_path,
+                "status": diff_file.status,
+                "additions": file_additions,
+                "deletions": file_deletions,
+                "hunks": hunks,
+            }
+        )
+
+    return {
+        "files": files,
+        "fileCount": len(files),
+        "totalAdditions": total_additions,
+        "totalDeletions": total_deletions,
+        "findingsMapped": findings_mapped,
+        "limitations": [],
+    }
+
+
+def _findings_by_location(report_output: str) -> dict[tuple[str, int], list[Finding]]:
+    if not report_output.strip():
+        return {}
+    try:
+        payload = json.loads(report_output)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+        return {}
+    findings_by_location: dict[tuple[str, int], list[Finding]] = {}
+    for item in payload["findings"]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            finding = Finding.model_validate(item)
+        except ValidationError:
+            continue
+        if finding.line is None:
+            continue
+        findings_by_location.setdefault((finding.path, finding.line), []).append(finding)
+    return findings_by_location
+
+
+def _line_findings(
+    findings_by_location: dict[tuple[str, int], list[Finding]],
+    path: str,
+    new_line_no: int | None,
+) -> list[dict]:
+    if new_line_no is None:
+        return []
+    return [
+        {
+            "severity": finding.severity,
+            "category": finding.category,
+            "confidence": finding.confidence,
+            "problem": finding.problem,
+            "suggestion": finding.suggestion,
+            "blocking": finding.blocking,
+        }
+        for finding in findings_by_location.get((path, new_line_no), [])
+    ]
 
 
 def doctor_payload(
@@ -767,10 +932,218 @@ class BatchReviewStore:
             self._requests.pop(batch_id, None)
 
 
+class WatcherStore:
+    def __init__(
+        self,
+        *,
+        review_starter: ReviewStarter,
+        github_factory: GitHubFactory,
+        max_watchers: int = 20,
+        storage_dir: Path | None = None,
+    ) -> None:
+        self._review_starter = review_starter
+        self._github_factory = github_factory
+        self._max_watchers = max_watchers
+        self._storage_dir = storage_dir
+        self._watchers: dict[str, WatcherJob] = {}
+        self._order: list[str] = []
+        self._threads: dict[str, threading.Thread] = {}
+        self._lock = threading.Lock()
+        self._load_from_disk()
+
+    def create(self, request: WatcherRunRequest) -> WatcherJob:
+        watcher = WatcherJob(
+            id=uuid.uuid4().hex,
+            request=request,
+            createdAt=_now(),
+        )
+        with self._lock:
+            self._watchers[watcher.id] = watcher
+            self._order.append(watcher.id)
+            self._trim_locked()
+            self._persist_locked(watcher)
+        return self.get(watcher.id)
+
+    def get(self, watcher_id: str) -> WatcherJob:
+        with self._lock:
+            return self._watchers[watcher_id].model_copy(deep=True)
+
+    def list_recent(self) -> list[dict]:
+        with self._lock:
+            watchers = [
+                self._watchers[watcher_id].model_copy(deep=True)
+                for watcher_id in reversed(self._order)
+            ]
+        return [_watcher_payload(watcher) for watcher in watchers]
+
+    def start(self, watcher_id: str) -> WatcherJob:
+        with self._lock:
+            watcher = self._watchers[watcher_id]
+            watcher.status = "running"
+            watcher.started_at = watcher.started_at or _now()
+            watcher.last_error = None
+            self._persist_locked(watcher)
+            thread = self._threads.get(watcher_id)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(target=self._run_loop, args=(watcher_id,), daemon=True)
+                self._threads[watcher_id] = thread
+                thread.start()
+            return watcher.model_copy(deep=True)
+
+    def pause(self, watcher_id: str) -> WatcherJob:
+        with self._lock:
+            watcher = self._watchers[watcher_id]
+            watcher.status = "paused"
+            self._persist_locked(watcher)
+            return watcher.model_copy(deep=True)
+
+    def delete(self, watcher_id: str) -> bool:
+        with self._lock:
+            if watcher_id not in self._watchers:
+                return False
+            self._watchers[watcher_id].status = "paused"
+            del self._watchers[watcher_id]
+            self._order = [current for current in self._order if current != watcher_id]
+            self._threads.pop(watcher_id, None)
+            self._delete_file_locked(watcher_id)
+            return True
+
+    def check_once(self, watcher_id: str) -> WatcherJob:
+        watcher = self.get(watcher_id)
+        triggered_reviews: list[WatcherTriggeredReview] = []
+        try:
+            with self._github_factory() as github:
+                pulls = github.list_repository_pulls(  # type: ignore[attr-defined]
+                    watcher.request.owner,
+                    watcher.request.repo,
+                    state=watcher.request.state,
+                )
+            for pull in pulls:
+                if bool(pull.get("draft")) and not watcher.request.include_drafts:
+                    continue
+                pr_number = int(pull.get("number") or 0)
+                if pr_number <= 0:
+                    continue
+                head_sha = _pull_head_sha(pull)
+                if not head_sha or watcher.seen_heads.get(pr_number) == head_sha:
+                    continue
+                review_request = _watcher_review_request(watcher.request, pull, pr_number)
+                review_job = self._review_starter(review_request)
+                triggered_reviews.append(
+                    WatcherTriggeredReview(
+                        prNumber=pr_number,
+                        prUrl=review_request.pr_url,
+                        title=str(pull.get("title") or ""),
+                        headSha=head_sha,
+                        jobId=str(getattr(review_job, "id", "") or "") or None,
+                        triggeredAt=_now(),
+                    )
+                )
+                watcher.seen_heads[pr_number] = head_sha
+        except Exception as exc:
+            return self._replace_watcher(
+                watcher.model_copy(
+                    update={
+                        "status": "failed",
+                        "last_checked_at": _now(),
+                        "last_error": str(exc),
+                        "triggered": 0,
+                    }
+                )
+            )
+
+        return self._replace_watcher(
+            watcher.model_copy(
+                update={
+                    "last_checked_at": _now(),
+                    "last_error": None,
+                    "triggered": len(triggered_reviews),
+                    "recent_reviews": [*triggered_reviews, *watcher.recent_reviews][:50],
+                }
+            )
+        )
+
+    def _replace_watcher(self, watcher: WatcherJob) -> WatcherJob:
+        with self._lock:
+            current = self._watchers.get(watcher.id)
+            if current is not None and current.status == "running" and watcher.status == "paused":
+                watcher = watcher.model_copy(update={"status": "running"})
+            self._watchers[watcher.id] = watcher
+            self._persist_locked(watcher)
+            return watcher.model_copy(deep=True)
+
+    def _run_loop(self, watcher_id: str) -> None:
+        while True:
+            try:
+                watcher = self.get(watcher_id)
+            except KeyError:
+                return
+            if watcher.status != "running":
+                return
+            checked = self.check_once(watcher_id)
+            if checked.status != "running":
+                return
+            _sleep_interruptibly(
+                checked.request.interval_seconds,
+                lambda: self._is_running(watcher_id),
+            )
+
+    def _is_running(self, watcher_id: str) -> bool:
+        with self._lock:
+            watcher = self._watchers.get(watcher_id)
+            return watcher is not None and watcher.status == "running"
+
+    def _trim_locked(self) -> None:
+        while len(self._order) > self._max_watchers:
+            watcher_id = self._order.pop(0)
+            self._watchers.pop(watcher_id, None)
+            self._threads.pop(watcher_id, None)
+            self._delete_file_locked(watcher_id)
+
+    def _load_from_disk(self) -> None:
+        if self._storage_dir is None or not self._storage_dir.exists():
+            return
+        loaded: list[WatcherJob] = []
+        for path in sorted(self._storage_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                watcher = WatcherJob.model_validate(payload)
+            except (OSError, ValueError, ValidationError):
+                continue
+            if watcher.status == "running":
+                watcher = watcher.model_copy(update={"status": "paused"})
+                try:
+                    path.write_text(watcher.model_dump_json(by_alias=True), encoding="utf-8")
+                except OSError:
+                    pass
+            loaded.append(watcher)
+        loaded.sort(key=lambda watcher: watcher.created_at)
+        with self._lock:
+            for watcher in loaded[-self._max_watchers :]:
+                self._watchers[watcher.id] = watcher
+                self._order.append(watcher.id)
+
+    def _persist_locked(self, watcher: WatcherJob) -> None:
+        if self._storage_dir is None:
+            return
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
+        target = self._storage_dir / f"{watcher.id}.json"
+        target.write_text(watcher.model_dump_json(by_alias=True), encoding="utf-8")
+
+    def _delete_file_locked(self, watcher_id: str) -> None:
+        if self._storage_dir is None:
+            return
+        try:
+            (self._storage_dir / f"{watcher_id}.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def create_handler(
     *,
     store: ReviewJobStore,
     batch_store: BatchReviewStore,
+    watcher_store: WatcherStore,
     quality_store: QualitySnapshotStore,
     frontend_dir: Path,
 ) -> type[BaseHTTPRequestHandler]:
@@ -807,6 +1180,18 @@ def create_handler(
             if path == "/api/batches":
                 self._send_json({"batches": batch_store.list_recent()})
                 return
+            if path == "/api/watchers":
+                self._send_json({"watchers": watcher_store.list_recent()})
+                return
+            if path.startswith("/api/watchers/"):
+                watcher_id = path.rsplit("/", 1)[-1]
+                try:
+                    watcher = watcher_store.get(watcher_id)
+                except KeyError:
+                    self._send_json({"error": "watcher not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(_watcher_payload(watcher))
+                return
             if path.startswith("/api/batches/"):
                 batch_id = path.rsplit("/", 1)[-1]
                 try:
@@ -818,6 +1203,9 @@ def create_handler(
                 return
             if path.startswith("/api/reviews/") and path.endswith("/export"):
                 self._handle_review_export(path)
+                return
+            if path.startswith("/api/reviews/") and path.endswith("/diff"):
+                self._handle_review_diff(path)
                 return
             if path.startswith("/api/reviews/") and path.endswith("/inline-preview"):
                 job_id = path.split("/")[-2]
@@ -856,6 +1244,12 @@ def create_handler(
             if path == "/api/batches":
                 self._handle_batch_start()
                 return
+            if path == "/api/watchers":
+                self._handle_watcher_create()
+                return
+            if path.startswith("/api/watchers/"):
+                self._handle_watcher_action(path)
+                return
             if path != "/api/reviews":
                 self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -886,6 +1280,42 @@ def create_handler(
             batch = batch_store.start(request)
             self._send_json(_batch_payload(batch), status=HTTPStatus.ACCEPTED)
 
+        def _handle_watcher_create(self) -> None:
+            try:
+                payload = self._read_json()
+                request = WatcherRunRequest.model_validate(payload)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except ValidationError as exc:
+                self._send_json({"error": "invalid watcher request", "details": exc.errors()}, status=422)
+                return
+            watcher = watcher_store.create(request)
+            watcher = watcher_store.start(watcher.id)
+            self._send_json(_watcher_payload(watcher), status=HTTPStatus.ACCEPTED)
+
+        def _handle_watcher_action(self, path: str) -> None:
+            parts = [part for part in path.split("/") if part]
+            if len(parts) != 4 or parts[0] != "api" or parts[1] != "watchers":
+                self._send_json({"error": "invalid watcher path"}, status=HTTPStatus.NOT_FOUND)
+                return
+            watcher_id = parts[2]
+            action = parts[3]
+            try:
+                if action == "start":
+                    self._send_json(_watcher_payload(watcher_store.start(watcher_id)))
+                    return
+                if action == "pause":
+                    self._send_json(_watcher_payload(watcher_store.pause(watcher_id)))
+                    return
+                if action == "check":
+                    self._send_json(_watcher_payload(watcher_store.check_once(watcher_id)))
+                    return
+            except KeyError:
+                self._send_json({"error": "watcher not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({"error": "unknown watcher action"}, status=HTTPStatus.NOT_FOUND)
+
         def do_DELETE(self) -> None:
             path = urlparse(self.path).path
             if path == "/api/reviews":
@@ -901,6 +1331,14 @@ def create_handler(
                     return
                 if not deleted:
                     self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"deleted": 1})
+                return
+            if path.startswith("/api/watchers/"):
+                watcher_id = path.rsplit("/", 1)[-1]
+                deleted = watcher_store.delete(watcher_id)
+                if not deleted:
+                    self._send_json({"error": "watcher not found"}, status=HTTPStatus.NOT_FOUND)
                     return
                 self._send_json({"deleted": 1})
                 return
@@ -963,6 +1401,25 @@ def create_handler(
                 content_type=content_type,
                 filename=f"ai-pr-review-{job_id}.{extension}",
             )
+
+        def _handle_review_diff(self, path: str) -> None:
+            job_id = path.split("/")[-2]
+            try:
+                job = store.get(job_id)
+                ref = parse_pr_url(job.request.pr_url)
+            except KeyError:
+                self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            except PRUrlError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                with _github_client() as github:
+                    raw_diff = github.get_pr_diff(ref)
+            except GitHubAPIError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+                return
+            self._send_json(diff_preview_payload(raw_diff, job.stdout))
 
         def _handle_doctor(self) -> None:
             query = parse_qs(urlparse(self.path).query)
@@ -1173,10 +1630,16 @@ def run_web_server(
     static_dir = Path(frontend_dir) if frontend_dir else root / "frontend" / "dist"
     store = ReviewJobStore(cwd=root, storage_dir=root / ".ai-pr-review" / "runs")
     batch_store = BatchReviewStore(review_store=store)
+    watcher_store = WatcherStore(
+        review_starter=store.start,
+        github_factory=_github_client,
+        storage_dir=root / ".ai-pr-review" / "watchers",
+    )
     quality_store = QualitySnapshotStore(root / ".ai-pr-review" / "quality-eval")
     handler = create_handler(
         store=store,
         batch_store=batch_store,
+        watcher_store=watcher_store,
         quality_store=quality_store,
         frontend_dir=static_dir,
     )
@@ -1198,6 +1661,10 @@ def _job_payload(job: ReviewJob) -> dict:
 
 def _batch_payload(batch: BatchReviewJob) -> dict:
     return batch.model_dump(by_alias=True)
+
+
+def _watcher_payload(watcher: WatcherJob) -> dict:
+    return watcher.model_dump(by_alias=True)
 
 
 def _batch_safe_request(request: ReviewRunRequest) -> ReviewRunRequest:
@@ -1273,6 +1740,50 @@ def _pull_number(pr_url: str) -> int | None:
         return parse_pr_url(pr_url).number
     except PRUrlError:
         return None
+
+
+def _pull_head_sha(pull: dict) -> str:
+    head = pull.get("head")
+    if isinstance(head, dict):
+        sha = head.get("sha")
+        if isinstance(sha, str):
+            return sha
+    return str(pull.get("updated_at") or "")
+
+
+def _watcher_review_request(
+    watcher_request: WatcherRunRequest,
+    pull: dict,
+    pr_number: int,
+) -> ReviewRunRequest:
+    pr_url = str(
+        pull.get("html_url")
+        or f"https://github.com/{watcher_request.owner}/{watcher_request.repo}/pull/{pr_number}"
+    )
+    return ReviewRunRequest(
+        prUrl=pr_url,
+        format="json",
+        postComment=False,
+        postInlineComments=False,
+        model=watcher_request.model_profile,
+        changedOnly=watcher_request.changed_only,
+        withContext=watcher_request.with_context,
+        noLlm=watcher_request.no_llm,
+        llmMaxChunks=watcher_request.llm_max_chunks,
+        maxFiles=watcher_request.max_files,
+        maxChunks=watcher_request.max_chunks,
+        maxContextFiles=watcher_request.max_context_files,
+        maxPatchLinesPerChunk=watcher_request.max_patch_lines_per_chunk,
+        debugChunks=True,
+    )
+
+
+def _sleep_interruptibly(seconds: int, keep_running: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not keep_running():
+            return
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def _progress_key(event: ProgressEvent) -> tuple[str, str, str, str, str | None]:

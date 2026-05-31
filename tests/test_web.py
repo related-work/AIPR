@@ -10,9 +10,12 @@ from ai_pr_review.web import (
     ReviewJob,
     ReviewJobStore,
     ReviewRunRequest,
+    WatcherRunRequest,
+    WatcherStore,
     build_cli_args,
     display_command,
     doctor_payload,
+    diff_preview_payload,
     github_pulls_payload,
     github_repos_payload,
     inline_preview_payload,
@@ -22,6 +25,7 @@ from ai_pr_review.web import (
     quality_evaluation_payload,
 )
 from ai_pr_review.config import ReviewConfig
+from ai_pr_review.github import GitHubAPIError
 from ai_pr_review.progress import PROGRESS_FILE_ENV, ProgressReporter
 from ai_pr_review.quality_eval import QualitySnapshotStore, evaluate_builtin_fixtures
 
@@ -213,6 +217,219 @@ def test_batch_review_store_keeps_running_after_single_pr_failure() -> None:
     assert [item.status for item in finished.items] == ["failed", "succeeded"]
     assert finished.items[0].error == "boom"
     assert finished.items[1].merge_recommendation == "merge"
+
+
+def test_watcher_store_triggers_reviews_for_new_and_changed_pr_heads() -> None:
+    started = []
+    pulls_by_round = [
+        [
+            {
+                "number": 1,
+                "title": "Update auth",
+                "html_url": "https://github.com/org/repo/pull/1",
+                "draft": False,
+                "head": {"sha": "sha-a"},
+            },
+            {
+                "number": 2,
+                "title": "Draft change",
+                "html_url": "https://github.com/org/repo/pull/2",
+                "draft": True,
+                "head": {"sha": "sha-draft"},
+            },
+        ],
+        [
+            {
+                "number": 1,
+                "title": "Update auth",
+                "html_url": "https://github.com/org/repo/pull/1",
+                "draft": False,
+                "head": {"sha": "sha-a"},
+            }
+        ],
+        [
+            {
+                "number": 1,
+                "title": "Update auth",
+                "html_url": "https://github.com/org/repo/pull/1",
+                "draft": False,
+                "head": {"sha": "sha-b"},
+            }
+        ],
+    ]
+
+    class FakeGitHub:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def list_repository_pulls(self, owner, repo, *, state="open"):
+            assert (owner, repo, state) == ("org", "repo", "open")
+            return pulls_by_round.pop(0)
+
+    def fake_start(request):
+        started.append(request)
+
+        class Job:
+            id = f"job-{len(started)}"
+
+        return Job()
+
+    store = WatcherStore(review_starter=fake_start, github_factory=FakeGitHub)
+    watcher = store.create(
+        WatcherRunRequest(owner="org", repo="repo", model="fast", includeDrafts=False)
+    )
+
+    first = store.check_once(watcher.id)
+    second = store.check_once(watcher.id)
+    third = store.check_once(watcher.id)
+
+    assert first.triggered == 1
+    assert second.triggered == 0
+    assert third.triggered == 1
+    assert [request.pr_url for request in started] == [
+        "https://github.com/org/repo/pull/1",
+        "https://github.com/org/repo/pull/1",
+    ]
+    assert all(request.output_format == "json" for request in started)
+    assert all(request.post_comment is False for request in started)
+    assert all(request.post_inline_comments is False for request in started)
+    assert store.get(watcher.id).seen_heads == {1: "sha-b"}
+
+
+def test_watcher_store_records_errors_and_supports_pause_resume() -> None:
+    class FailingGitHub:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def list_repository_pulls(self, owner, repo, *, state="open"):
+            raise GitHubAPIError("rate limit")
+
+    store = WatcherStore(review_starter=lambda request: None, github_factory=FailingGitHub)
+    watcher = store.create(WatcherRunRequest(owner="org", repo="repo", intervalSeconds=60))
+
+    assert watcher.status == "paused"
+    assert store.start(watcher.id).status == "running"
+    checked = store.check_once(watcher.id)
+
+    assert checked.status == "failed"
+    assert checked.last_error == "rate limit"
+    assert store.pause(watcher.id).status == "paused"
+
+
+def test_watcher_store_delete_running_watcher_stops_polling() -> None:
+    calls = []
+
+    class FakeGitHub:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def list_repository_pulls(self, owner, repo, *, state="open"):
+            calls.append((owner, repo, state))
+            return []
+
+    store = WatcherStore(review_starter=lambda request: None, github_factory=FakeGitHub)
+    watcher = store.create(WatcherRunRequest(owner="org", repo="repo", intervalSeconds=10))
+    store.start(watcher.id)
+
+    deadline = time.monotonic() + 1
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert calls == [("org", "repo", "open")]
+    assert store.delete(watcher.id) is True
+
+
+def test_watcher_store_persists_seen_heads_and_recent_reviews(tmp_path) -> None:
+    started = []
+
+    class FakeGitHub:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def list_repository_pulls(self, owner, repo, *, state="open"):
+            assert (owner, repo, state) == ("org", "repo", "open")
+            return [
+                {
+                    "number": 7,
+                    "title": "Persist watcher",
+                    "html_url": "https://github.com/org/repo/pull/7",
+                    "draft": False,
+                    "head": {"sha": "sha-persisted"},
+                }
+            ]
+
+    def fake_start(request):
+        started.append(request)
+
+        class Job:
+            id = "job-persisted"
+
+        return Job()
+
+    store = WatcherStore(
+        review_starter=fake_start,
+        github_factory=FakeGitHub,
+        storage_dir=tmp_path,
+    )
+    watcher = store.create(WatcherRunRequest(owner="org", repo="repo", intervalSeconds=60))
+    store.check_once(watcher.id)
+
+    restored = WatcherStore(
+        review_starter=fake_start,
+        github_factory=FakeGitHub,
+        storage_dir=tmp_path,
+    ).get(watcher.id)
+
+    assert restored.status == "paused"
+    assert restored.seen_heads == {7: "sha-persisted"}
+    assert restored.recent_reviews[0].job_id == "job-persisted"
+    assert restored.recent_reviews[0].pr_url == "https://github.com/org/repo/pull/7"
+
+
+def test_watcher_store_restores_running_watchers_as_paused(tmp_path) -> None:
+    watcher_id = "running-before-restart"
+    (tmp_path / f"{watcher_id}.json").write_text(
+        json.dumps(
+            {
+                "id": watcher_id,
+                "status": "running",
+                "request": {
+                    "owner": "org",
+                    "repo": "repo",
+                    "intervalSeconds": 60,
+                },
+                "createdAt": "2026-05-31T00:00:00+00:00",
+                "startedAt": "2026-05-31T00:00:01+00:00",
+                "lastCheckedAt": "2026-05-31T00:00:02+00:00",
+                "lastError": None,
+                "triggered": 1,
+                "seenHeads": {"3": "sha-before-restart"},
+                "recentReviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = WatcherStore(
+        review_starter=lambda request: None,
+        github_factory=lambda: None,
+        storage_dir=tmp_path,
+    ).get(watcher_id)
+
+    assert restored.status == "paused"
+    assert restored.seen_heads == {3: "sha-before-restart"}
 
 
 def test_review_job_store_records_progress_for_successful_job() -> None:
@@ -665,6 +882,50 @@ def test_inline_preview_payload_returns_parse_error_for_markdown_report() -> Non
         "skippedCount": 0,
         "limitations": ["当前报告不是 JSON 输出，无法生成结构化 inline 预览"],
     }
+
+
+def test_diff_preview_payload_builds_hunks_and_maps_findings() -> None:
+    report = {
+        "findings": [
+            {
+                "path": "src/app.py",
+                "line": 2,
+                "severity": "high",
+                "category": "security",
+                "confidence": 0.91,
+                "evidence": ["+    query = f\"select * from users where id={user_id}\""],
+                "problem": "SQL 拼接可能导致注入。",
+                "suggestion": "使用参数化查询。",
+                "blocking": True,
+            }
+        ]
+    }
+    raw_diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1,3 +1,4 @@
+ def handler(user_id):
+-    return db.query("select * from users")
++    query = f"select * from users where id={user_id}"
++    return db.query(query)
+"""
+
+    payload = diff_preview_payload(raw_diff, json.dumps(report))
+
+    assert payload["fileCount"] == 1
+    assert payload["totalAdditions"] == 2
+    assert payload["totalDeletions"] == 1
+    assert payload["findingsMapped"] == 1
+    file_payload = payload["files"][0]
+    assert file_payload["path"] == "src/app.py"
+    assert file_payload["status"] == "modified"
+    assert file_payload["additions"] == 2
+    assert file_payload["deletions"] == 1
+    added_query_line = file_payload["hunks"][0]["lines"][2]
+    assert added_query_line["kind"] == "add"
+    assert added_query_line["newLine"] == 2
+    assert added_query_line["findings"][0]["severity"] == "high"
+    assert added_query_line["findings"][0]["blocking"] is True
 
 
 def test_doctor_payload_returns_config_status_without_secret_values() -> None:
