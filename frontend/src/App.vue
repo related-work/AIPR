@@ -1,8 +1,9 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
-import { Activity, FileText, History, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
+import { Activity, FileText, History, ListChecks, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
 
 import AppShell from "./components/AppShell.vue";
+import BatchReviewPanel from "./components/BatchReviewPanel.vue";
 import CommandModal from "./components/CommandModal.vue";
 import HelpPanel from "./components/HelpPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
@@ -25,6 +26,10 @@ const form = reactive({
   withContext: false,
   noLlm: false,
   llmMaxChunks: 2,
+  maxFiles: 80,
+  maxChunks: 40,
+  maxContextFiles: 20,
+  maxPatchLinesPerChunk: 400,
   debugChunks: true
 });
 
@@ -46,6 +51,10 @@ const showCommand = ref(false);
 const copied = ref(false);
 const job = ref(null);
 const runError = ref("");
+const batchJob = ref(null);
+const batchError = ref("");
+const batchPollingTimer = ref(null);
+const selectedBatchPullUrls = ref([]);
 const historyJobs = ref([]);
 const historyError = ref("");
 const loadingHistory = ref(false);
@@ -74,6 +83,7 @@ const historyFilters = reactive({
 const navItems = [
   { id: "browse", label: "PR 浏览", icon: SearchCode },
   { id: "review", label: "Review 运行", icon: Play },
+  { id: "batch", label: "批量 Review", icon: ListChecks },
   { id: "report", label: "报告结果", icon: FileText },
   { id: "history", label: "历史记录", icon: History },
   { id: "quality", label: "质量评测", icon: Activity },
@@ -93,6 +103,10 @@ const templates = [
       withContext: false,
       noLlm: true,
       llmMaxChunks: 2,
+      maxFiles: 80,
+      maxChunks: 40,
+      maxContextFiles: 20,
+      maxPatchLinesPerChunk: 400,
       debugChunks: true,
       postComment: false,
       postInlineComments: false
@@ -109,6 +123,10 @@ const templates = [
       withContext: false,
       noLlm: false,
       llmMaxChunks: 2,
+      maxFiles: 80,
+      maxChunks: 40,
+      maxContextFiles: 20,
+      maxPatchLinesPerChunk: 400,
       debugChunks: true,
       postComment: false,
       postInlineComments: false
@@ -125,6 +143,10 @@ const templates = [
       withContext: true,
       noLlm: false,
       llmMaxChunks: 6,
+      maxFiles: 120,
+      maxChunks: 80,
+      maxContextFiles: 30,
+      maxPatchLinesPerChunk: 400,
       debugChunks: true,
       postComment: false,
       postInlineComments: false
@@ -141,6 +163,10 @@ const templates = [
       withContext: false,
       noLlm: false,
       llmMaxChunks: 2,
+      maxFiles: 80,
+      maxChunks: 40,
+      maxContextFiles: 20,
+      maxPatchLinesPerChunk: 400,
       debugChunks: false,
       postComment: false,
       postInlineComments: false
@@ -158,13 +184,19 @@ const optionDocs = [
   { title: "--with-context", body: "检索同名测试、相邻模块、配置文件等上下文。changed-only 开启时不会生效。" },
   { title: "--no-llm", body: "跳过模型，只运行规则引擎，适合快速检查明确风险。" },
   { title: "--llm-max-chunks", body: "限制送入模型的 diff chunk 数量。越大越全面，也越慢越贵。" },
+  { title: "--max-files", body: "限制进入深度分析的高优先级文件数，大 PR 用它控制范围。" },
+  { title: "--max-chunks", body: "限制进入分析候选集的高优先级 chunk 数量。" },
+  { title: "--max-context-files", body: "限制上下文检索文件数，避免复杂 PR 拉取过多无关文件。" },
+  { title: "--max-patch-lines-per-chunk", body: "单个 chunk 的目标 patch 行数预算，报告会记录该预算。" },
   { title: "--debug-chunks", body: "在报告中展示 chunk 排序和选择原因，方便调试分析覆盖。" }
 ];
 
 const isRunning = computed(() => ["queued", "running"].includes(job.value?.status));
+const isBatchRunning = computed(() => ["queued", "running"].includes(batchJob.value?.status));
 const isBrowsing = computed(() => loadingRepos.value || loadingPulls.value);
 const selectedRepo = computed(() => repos.value.find((repo) => repo.name === explorer.repo));
 const selectedPull = computed(() => pulls.value.find((pull) => pull.url === explorer.pullUrl));
+const selectedBatchPulls = computed(() => pulls.value.filter((pull) => selectedBatchPullUrls.value.includes(pull.url)));
 const selectedPrLabel = computed(() => {
   if (selectedPull.value) {
     return `#${selectedPull.value.number} ${selectedPull.value.title}`;
@@ -198,6 +230,10 @@ const cliArgs = computed(() => {
   if (form.withContext) args.push("--with-context");
   if (form.noLlm) args.push("--no-llm");
   if (form.llmMaxChunks) args.push("--llm-max-chunks", String(form.llmMaxChunks));
+  if (form.maxFiles) args.push("--max-files", String(form.maxFiles));
+  if (form.maxChunks) args.push("--max-chunks", String(form.maxChunks));
+  if (form.maxContextFiles) args.push("--max-context-files", String(form.maxContextFiles));
+  if (form.maxPatchLinesPerChunk) args.push("--max-patch-lines-per-chunk", String(form.maxPatchLinesPerChunk));
   if (form.debugChunks) args.push("--debug-chunks");
   return args;
 });
@@ -244,6 +280,7 @@ async function loadRepositories() {
   browseError.value = "";
   repos.value = [];
   pulls.value = [];
+  selectedBatchPullUrls.value = [];
   explorer.repo = "";
   explorer.pullUrl = "";
   loadingRepos.value = true;
@@ -272,6 +309,7 @@ async function loadPullRequests() {
   }
   browseError.value = "";
   pulls.value = [];
+  selectedBatchPullUrls.value = [];
   explorer.pullUrl = "";
   loadingPulls.value = true;
   try {
@@ -318,6 +356,10 @@ function requestPayload() {
     withContext: form.withContext,
     noLlm: form.noLlm,
     llmMaxChunks: form.llmMaxChunks || null,
+    maxFiles: form.maxFiles || null,
+    maxChunks: form.maxChunks || null,
+    maxContextFiles: form.maxContextFiles || null,
+    maxPatchLinesPerChunk: form.maxPatchLinesPerChunk || null,
     debugChunks: form.debugChunks
   };
 }
@@ -333,6 +375,10 @@ function applyRequest(request) {
   form.withContext = Boolean(request.withContext);
   form.noLlm = Boolean(request.noLlm);
   form.llmMaxChunks = request.llmMaxChunks || form.llmMaxChunks;
+  form.maxFiles = request.maxFiles || form.maxFiles;
+  form.maxChunks = request.maxChunks || form.maxChunks;
+  form.maxContextFiles = request.maxContextFiles || form.maxContextFiles;
+  form.maxPatchLinesPerChunk = request.maxPatchLinesPerChunk || form.maxPatchLinesPerChunk;
   form.debugChunks = Boolean(request.debugChunks);
 }
 
@@ -357,6 +403,95 @@ async function runReview() {
     pollJob(payload.id);
   } catch (error) {
     runError.value = error.message;
+  }
+}
+
+function toggleBatchPull(url) {
+  if (selectedBatchPullUrls.value.includes(url)) {
+    selectedBatchPullUrls.value = selectedBatchPullUrls.value.filter((item) => item !== url);
+    return;
+  }
+  selectedBatchPullUrls.value = [...selectedBatchPullUrls.value, url];
+}
+
+function selectAllBatchPulls() {
+  selectedBatchPullUrls.value = pulls.value.map((pull) => pull.url);
+}
+
+function clearBatchSelection() {
+  selectedBatchPullUrls.value = [];
+}
+
+async function runBatchReview() {
+  if (isBatchRunning.value) {
+    return;
+  }
+  if (!selectedBatchPulls.value.length) {
+    batchError.value = "请先选择至少一个 PR";
+    return;
+  }
+  batchError.value = "";
+  batchJob.value = null;
+  const requests = selectedBatchPulls.value.map((pull) => ({
+    ...requestPayload(),
+    prUrl: pull.url,
+    format: "json",
+    postComment: false,
+    postInlineComments: false
+  }));
+  try {
+    const response = await fetch("/api/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "启动批量 Review 失败");
+    }
+    batchJob.value = payload;
+    pollBatch(payload.id);
+  } catch (error) {
+    batchError.value = error.message;
+  }
+}
+
+function pollBatch(batchId) {
+  window.clearInterval(batchPollingTimer.value);
+  batchPollingTimer.value = window.setInterval(async () => {
+    try {
+      const response = await fetch(`/api/batches/${batchId}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "获取批量任务状态失败");
+      }
+      batchJob.value = payload;
+      if (!["queued", "running"].includes(payload.status)) {
+        window.clearInterval(batchPollingTimer.value);
+        loadHistory();
+      }
+    } catch (error) {
+      batchError.value = error.message;
+      window.clearInterval(batchPollingTimer.value);
+    }
+  }, 900);
+}
+
+async function openBatchReport(item) {
+  if (!item.jobId) {
+    return;
+  }
+  batchError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${item.jobId}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取批量报告失败");
+    }
+    job.value = payload;
+    activeView.value = "report";
+  } catch (error) {
+    batchError.value = error.message;
   }
 }
 
@@ -577,6 +712,9 @@ function navigate(view) {
   if (view === "quality" && !qualitySnapshots.value.length) {
     loadQualitySnapshots();
   }
+  if (view === "batch" && !pulls.value.length && explorer.repo) {
+    loadPullRequests();
+  }
 }
 
 function pollJob(jobId) {
@@ -602,13 +740,14 @@ function pollJob(jobId) {
 
 onBeforeUnmount(() => {
   window.clearInterval(pollingTimer.value);
+  window.clearInterval(batchPollingTimer.value);
 });
 </script>
 
 <template>
   <AppShell
     :active-view="activeView"
-    :is-running="isRunning"
+    :is-running="isRunning || isBatchRunning"
     :nav-items="navItems"
     :selected-pr-label="selectedPrLabel"
     @navigate="navigate"
@@ -645,6 +784,23 @@ onBeforeUnmount(() => {
       @go-browse="activeView = 'browse'"
       @open-command="showCommand = true"
       @run="runReview"
+    />
+
+    <BatchReviewPanel
+      v-else-if="activeView === 'batch'"
+      :batch-error="batchError"
+      :batch-job="batchJob"
+      :is-running="isBatchRunning"
+      :loading-pulls="loadingPulls"
+      :pulls="pulls"
+      :selected-repo="selectedRepo"
+      :selected-urls="selectedBatchPullUrls"
+      @clear-selection="clearBatchSelection"
+      @go-browse="activeView = 'browse'"
+      @open-report="openBatchReport"
+      @run="runBatchReview"
+      @select-all="selectAllBatchPulls"
+      @toggle-pull="toggleBatchPull"
     />
 
     <ReportViewer

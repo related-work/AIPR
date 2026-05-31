@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ai_pr_review.aggregate import aggregate_report, should_fail_ci
-from ai_pr_review.schemas import Finding
+from ai_pr_review.schemas import AnalysisCoverage, Finding
 
 
 def test_aggregate_dedupes_drops_unsupported_and_calibrates_blocking() -> None:
@@ -91,6 +91,30 @@ def test_aggregate_allows_merge_with_non_blocking_suggestions() -> None:
 
     assert report.merge_recommendation == "merge_with_suggestions"
     assert should_fail_ci(report, "low") is False
+
+
+def test_aggregate_downgrades_merge_recommendation_for_large_pr_low_coverage() -> None:
+    report = aggregate_report(
+        pr={"html_url": "https://github.com/org/repo/pull/22", "title": "Large change", "body": ""},
+        files=[{"filename": f"src/file_{index}.py", "additions": 10, "deletions": 0} for index in range(40)],
+        commits=[],
+        comments=[],
+        findings=[],
+        limitations=[],
+        analysis_coverage=AnalysisCoverage(
+            large_pr=True,
+            changed_files=40,
+            analyzed_files=6,
+            skipped_files=34,
+            total_chunks=60,
+            llm_analyzed_chunks=8,
+            rules_scanned_files=40,
+            coverage_ratio=0.15,
+        ),
+    )
+
+    assert report.merge_recommendation == "merge_with_suggestions"
+    assert any("覆盖率较低" in item for item in report.limitations)
 
 
 def test_aggregate_drops_llm_findings_outside_changed_files() -> None:

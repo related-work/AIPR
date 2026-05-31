@@ -8,127 +8,160 @@ The project currently provides:
 - Local Python web backend serving Vue assets and API endpoints.
 - GitHub owner/repository/PR browser.
 - Review runner with Markdown/JSON output.
-- Markdown report rendering in the browser.
+- Structured report UI for JSON output, including risk cards, merge recommendation, severity grouping,
+  evidence, confidence, blocking flag, suggestions, and raw Markdown/JSON tabs.
 - GitHub summary comment and guarded inline review comments.
+- Inline comment preview before writing comments back to GitHub.
 - Process-local and persisted review history under `.ai-pr-review/runs/`.
 - CLI-to-Web review progress events with a report-page timeline.
 - Local history management with filtering, deletion, clearing, and Markdown/JSON export.
+- Settings doctor page for local GitHub/OpenAI configuration checks without exposing secrets.
 - Deterministic `ai-pr-review eval` fixtures for high-quality, low-quality, harmful, and clean PR examples.
 - Web quality evaluation view backed by the same deterministic local fixtures.
 - Local quality evaluation snapshots and baseline comparison.
+- Large PR and batch PR handling design in `docs/large-and-batch-pr-handling.md`.
+- Large PR budgets for files, chunks, LLM chunks, context files, patch lines, and report-level
+  `analysisCoverage`.
+- Large PR per-file coverage transparency with analyzed/rule-only/skipped status and high-risk unreviewed
+  file highlighting.
+- Process-local Batch Review overview for selected repository PRs, with sequential per-PR jobs and
+  independent report links.
 
 The backend is local-first. It reads credentials from environment variables or `.ai-pr-review.local.yml`; secrets are not sent to the browser.
 
-## Upgrade Priorities
+## Upgrade Status
 
-### 1. Structured Report UI
+## Completed Upgrade Slices
 
-Problem: the report page renders Markdown but does not expose the report as inspectable product UI.
+The following slices from the original roadmap are already implemented:
 
-Target:
+- Structured Report UI.
+- Inline Comment Preview.
+- Doctor Page Integration.
+- Review Progress Events.
+- History Management.
+- Review Quality Evaluation Set.
+- Large PR Analysis Coverage.
+- Large PR Skipped-File Transparency.
+- Batch PR Review Overview.
 
-- Parse JSON reports when available.
-- Show risk overview cards.
-- Show merge recommendation.
-- Show findings grouped by severity and file.
-- Show evidence, confidence, blocking flag, and suggestion per finding.
-- Keep raw Markdown/JSON tabs for auditability.
+CI quality gates are intentionally not the next default slice. The project is still a local-first review
+assistant, and a CI gate would duplicate existing test/eval commands without improving the day-to-day review
+experience yet. It can be revisited after the evaluation set is larger and has real-world baselines.
 
-Reason:
+## Open Upgrade Priorities
 
-This improves review speed and makes the tool feel like a product instead of a terminal wrapper.
+### 1. Batch PR History Management
 
-### 2. Inline Comment Preview
-
-Problem: `--post-inline-comments` can write to GitHub, but the user cannot preview the exact comments first.
-
-Target:
-
-- Add backend preview endpoint for inline comments.
-- Show which findings are commentable and which were skipped.
-- Display path, line, severity, body, and limitations.
-- Keep actual posting opt-in only.
-
-Reason:
-
-Inline comments are high impact. Preview reduces accidental noise and builds trust.
-
-### 3. Doctor Page Integration
-
-Problem: the settings page only explains local config; it does not run `doctor`.
+Problem: batch runs are process-local and visible while the Web server is running, but not yet persisted as
+their own batch history.
 
 Target:
 
-- Add `/api/doctor`.
-- Show GitHub token configured status.
-- Show OpenAI key/base URL/model/API mode.
-- Support smoke test.
-- Never display secret values.
+- Persist batch run summaries under `.ai-pr-review/batches/`.
+- Reopen a batch run after Web restart.
+- Retry only failed batch items.
+- Export batch overview as Markdown/JSON.
 
 Reason:
 
-Most user setup issues are environment/config issues. A UI health check shortens debugging.
+Per-PR reports are already persisted through review history, but maintainers also need the batch-level triage
+record.
 
-### 4. Review Progress Events
+Reference: `docs/large-and-batch-pr-handling.md`.
 
-Problem: long runs show only coarse job status.
+### 2. Finding Triage Workspace
+
+Problem: the report page can show structured findings, but it does not yet support reviewer workflow states.
 
 Target:
 
-- Track stages: GitHub fetch, diff parse, rules, LLM, verification, aggregation, writeback.
-- Show stage timeline in the report page.
+- Let users mark findings as accepted, false positive, ignored, or fixed locally.
+- Filter findings by severity, blocking flag, source, file, and confidence.
+- Add one-click copy for a single finding as a GitHub-ready comment.
+- Persist triage state under `.ai-pr-review/runs/` without writing to GitHub.
 
 Reason:
 
-The user needs to know whether work is slow, blocked on GitHub, or blocked on the model.
+This turns the report from a static output into a reviewer workbench, while keeping writeback opt-in.
 
-### 5. History Management
+### 3. Context Transparency
 
-Problem: history is persisted but not manageable.
+Problem: users cannot easily see why the tool reached a conclusion or whether enough code context was available.
 
 Target:
 
-- Delete one run.
-- Clear all history.
-- Search/filter by PR URL, status, repository, or date.
-- Export Markdown/JSON.
+- Show analyzed chunks, skipped files, generated/lock/doc classifications, and context files used.
+- Show LLM chunk limits, truncation reasons, and rules that fired.
+- Add a compact "analysis limitations" panel per run.
 
 Reason:
 
-Persistent local data needs management once the tool is used repeatedly.
+Trust depends on knowing what evidence the tool actually saw, especially for large PRs.
 
-### 6. Review Quality Evaluation Set
+### 4. Prompt And Rule Calibration
 
-Problem: quality improvements are currently manual and PR-by-PR.
+Problem: quality evaluation currently covers deterministic rules well, but not enough LLM/verifier behavior.
 
 Target:
 
-- Store fixture diffs and expected findings.
-- Add regression tests for high-quality, low-quality, harmful, and clean PRs.
-- Track false positives and false negatives.
+- Add fixtures that exercise LLM-only reasoning, verifier rejection, and comment-context handling.
+- Track expected categories and severities without requiring exact wording.
+- Compare current output against saved quality snapshots.
+- Keep tests network-free by using fake LLM outputs.
 
 Reason:
 
-This turns prompt/rule/model changes into measurable engineering work.
+This improves accuracy without forcing CI adoption or depending on live model calls.
+
+### 5. Review Run Comparison
+
+Problem: users cannot compare two runs of the same PR after changing config, prompt, model, or context options.
+
+Target:
+
+- Compare findings added/removed/changed between two history runs.
+- Compare merge recommendation, risk counts, model settings, and limitations.
+- Highlight whether an upgrade reduced noise or missed important findings.
+
+Reason:
+
+This makes iterative prompt/rule tuning measurable on real PRs.
+
+### 6. Repository Review Profile
+
+Problem: `.ai-pr-review.yml` supports team rules, but Web users still need to edit it manually.
+
+Target:
+
+- Add a Web editor for non-secret local/team review settings.
+- Manage ignore paths, high-risk paths, required-test paths, and preferred model mode.
+- Validate config before saving.
+- Keep secrets in environment variables or `.ai-pr-review.local.yml` only.
+
+Reason:
+
+This makes the tool easier to tune per repository without weakening secret handling.
 
 ## Recommended Next Slice
 
 Implement:
 
-1. Expand quality evaluation coverage to LLM/verifier outputs.
-2. Add CI-friendly quality gate based on evaluation snapshots.
+1. Batch PR history management.
+2. Finding triage workspace.
 
 Scope constraints:
 
 - Do not add a database.
 - Keep fixture tests deterministic and network-free.
-- Keep default evaluation rules-only unless explicitly configured.
-- Track expected findings without requiring exact model wording.
+- Do not write back to GitHub unless the user explicitly clicks or passes a writeback flag.
+- Persist local-only state under `.ai-pr-review/runs/`.
 - Keep all secrets backend-only.
+- Preserve current single-PR workflow as the default path.
 
 Expected commits:
 
 ```text
-test: expand review quality fixtures
-feat: add quality evaluation ci gate
+feat: persist batch review history
+feat: add finding triage workspace
 ```

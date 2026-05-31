@@ -47,6 +47,14 @@ def test_cli_parses_options_renders_json_and_returns_failure_for_threshold() -> 
             "--with-context",
             "--llm-max-chunks",
             "2",
+            "--max-files",
+            "10",
+            "--max-chunks",
+            "20",
+            "--max-context-files",
+            "5",
+            "--max-patch-lines-per-chunk",
+            "120",
             "--debug-chunks",
             "--no-llm",
             "--post-inline-comments",
@@ -64,6 +72,10 @@ def test_cli_parses_options_renders_json_and_returns_failure_for_threshold() -> 
     assert runner.calls[0]["changed_only"] is True
     assert runner.calls[0]["with_context"] is True
     assert runner.calls[0]["llm_max_chunks"] == 2
+    assert runner.calls[0]["max_files"] == 10
+    assert runner.calls[0]["max_chunks"] == 20
+    assert runner.calls[0]["max_context_files"] == 5
+    assert runner.calls[0]["max_patch_lines_per_chunk"] == 120
     assert runner.calls[0]["debug_chunks"] is True
     assert runner.calls[0]["no_llm"] is True
     assert runner.calls[0]["post_inline_comments"] is True

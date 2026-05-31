@@ -5,6 +5,8 @@ import threading
 import time
 
 from ai_pr_review.web import (
+    BatchReviewRunRequest,
+    BatchReviewStore,
     ReviewJob,
     ReviewJobStore,
     ReviewRunRequest,
@@ -36,6 +38,10 @@ def test_build_cli_args_includes_review_options() -> None:
         withContext=True,
         noLlm=True,
         llmMaxChunks=3,
+        maxFiles=10,
+        maxChunks=20,
+        maxContextFiles=5,
+        maxPatchLinesPerChunk=120,
         debugChunks=True,
     )
 
@@ -54,6 +60,14 @@ def test_build_cli_args_includes_review_options() -> None:
         "--no-llm",
         "--llm-max-chunks",
         "3",
+        "--max-files",
+        "10",
+        "--max-chunks",
+        "20",
+        "--max-context-files",
+        "5",
+        "--max-patch-lines-per-chunk",
+        "120",
         "--debug-chunks",
     ]
     assert display_command(request).startswith("ai-pr-review https://github.com/org/repo/pull/123")
@@ -92,6 +106,113 @@ def test_review_job_store_tracks_successful_job() -> None:
     assert "建议合并" in finished.stdout
     assert calls[0][0][-4:] == ["--changed-only", "--llm-max-chunks", "2", "--debug-chunks"]
     assert "PYTHONPATH" in calls[0][2]
+
+
+def test_batch_review_store_runs_prs_sequentially_and_summarizes_results() -> None:
+    calls = []
+
+    def fake_executor(command, *, cwd, env):
+        pr_url = next(arg for arg in command if arg.startswith("https://github.com/"))
+        calls.append(pr_url)
+        blocking = 1 if pr_url.endswith("/1") else 0
+        risk_high = 1 if blocking else 0
+        merge = "do_not_merge" if blocking else "merge"
+
+        class Result:
+            pass
+
+        Result.returncode = 0
+        Result.stdout = json.dumps(
+            {
+                "riskOverview": {
+                    "critical": 0,
+                    "high": risk_high,
+                    "medium": 0,
+                    "low": 0,
+                    "blocking": blocking,
+                },
+                "mergeRecommendation": merge,
+                "analysisCoverage": {"coverageRatio": 1.0},
+            }
+        )
+        Result.stderr = ""
+
+        return Result()
+
+    review_store = ReviewJobStore(executor=fake_executor)
+    batch_store = BatchReviewStore(review_store=review_store, poll_interval=0.01)
+
+    batch = batch_store.start(
+        BatchReviewRunRequest(
+            requests=[
+                ReviewRunRequest(pr_url="https://github.com/org/repo/pull/1", format="markdown"),
+                ReviewRunRequest(pr_url="https://github.com/org/repo/pull/2", format="markdown"),
+            ]
+        )
+    )
+
+    deadline = time.monotonic() + 3
+    while batch_store.get(batch.id).status in {"queued", "running"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    finished = batch_store.get(batch.id)
+
+    assert finished.status == "succeeded"
+    assert calls == [
+        "https://github.com/org/repo/pull/1",
+        "https://github.com/org/repo/pull/2",
+    ]
+    assert [item.status for item in finished.items] == ["succeeded", "succeeded"]
+    assert [item.risk for item in finished.items] == ["high", "low"]
+    assert finished.items[0].merge_recommendation == "do_not_merge"
+    assert finished.items[0].blocking_findings == 1
+    assert finished.items[0].coverage_ratio == 1.0
+    assert finished.items[0].job_id is not None
+    assert review_store.get(finished.items[0].job_id).request.output_format == "json"
+    assert review_store.get(finished.items[0].job_id).request.post_comment is False
+
+
+def test_batch_review_store_keeps_running_after_single_pr_failure() -> None:
+    def fake_executor(command, *, cwd, env):
+        pr_url = next(arg for arg in command if arg.startswith("https://github.com/"))
+        returncode = 2 if pr_url.endswith("/1") else 0
+
+        class Result:
+            pass
+
+        Result.returncode = returncode
+        Result.stdout = "" if returncode == 2 else json.dumps(
+            {
+                "riskOverview": {"critical": 0, "high": 0, "medium": 0, "low": 0, "blocking": 0},
+                "mergeRecommendation": "merge",
+                "analysisCoverage": {"coverageRatio": 1.0},
+            }
+        )
+        Result.stderr = "boom" if returncode == 2 else ""
+        return Result()
+
+    review_store = ReviewJobStore(executor=fake_executor)
+    batch_store = BatchReviewStore(review_store=review_store, poll_interval=0.01)
+
+    batch = batch_store.start(
+        BatchReviewRunRequest(
+            requests=[
+                ReviewRunRequest(pr_url="https://github.com/org/repo/pull/1"),
+                ReviewRunRequest(pr_url="https://github.com/org/repo/pull/2"),
+            ]
+        )
+    )
+
+    deadline = time.monotonic() + 3
+    while batch_store.get(batch.id).status in {"queued", "running"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    finished = batch_store.get(batch.id)
+
+    assert finished.status == "failed"
+    assert [item.status for item in finished.items] == ["failed", "succeeded"]
+    assert finished.items[0].error == "boom"
+    assert finished.items[1].merge_recommendation == "merge"
 
 
 def test_review_job_store_records_progress_for_successful_job() -> None:

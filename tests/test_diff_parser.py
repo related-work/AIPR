@@ -75,3 +75,28 @@ index 3333333..4444444 100644
     assert any("docs/readme.md" in item for item in limitations)
     assert any("package-lock.json" in item for item in limitations)
     assert any("assets/logo.png" in item for item in limitations)
+
+
+def test_build_chunks_splits_large_hunks_by_patch_line_budget() -> None:
+    raw_diff = """diff --git a/src/large.py b/src/large.py
+--- a/src/large.py
++++ b/src/large.py
+@@ -1,6 +1,6 @@
+-old_1
++new_1
+-old_2
++new_2
+-old_3
++new_3
+"""
+    files = parse_diff(raw_diff)
+
+    chunks, limitations = build_chunks(
+        files,
+        [{"filename": "src/large.py", "patch": files[0].patch}],
+        max_patch_lines_per_chunk=2,
+    )
+
+    assert [chunk.new_start for chunk in chunks] == [1, 2, 3]
+    assert all(len(chunk.patch.splitlines()) <= 3 for chunk in chunks)
+    assert limitations == []

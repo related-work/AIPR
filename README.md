@@ -20,6 +20,7 @@ ai-pr-review https://github.com/org/repo/pull/123 --fail-on high
 ai-pr-review https://github.com/org/repo/pull/123 --with-context
 ai-pr-review https://github.com/org/repo/pull/123 --no-llm
 ai-pr-review https://github.com/org/repo/pull/123 --llm-max-chunks 2
+ai-pr-review https://github.com/org/repo/pull/123 --max-files 80 --max-chunks 40
 ai-pr-review https://github.com/org/repo/pull/123 --post-comment
 ai-pr-review https://github.com/org/repo/pull/123 --post-inline-comments
 ai-pr-review eval
@@ -47,7 +48,10 @@ The page supports two workflows:
 - Generate a copyable CLI command from PR URL and options.
 - Run the review through the local Python API and view the report in the browser.
 - Enter a GitHub user or organization, load repositories, select a repository, and auto-fill an open PR.
+- Select multiple repository PRs in Batch Review and run them sequentially with an overview table.
 - View recent review runs in the History view, reopen reports, and rerun with the same options.
+- Tune Large PR budgets and view analysis coverage in structured reports.
+- Inspect per-file Large PR coverage, including analyzed, rule-only, skipped, and high-risk unreviewed files.
 - Run local quality evaluation fixtures from the Quality view.
 - Save quality evaluation snapshots and compare later runs against a baseline.
 
@@ -147,13 +151,25 @@ Speed controls:
 
 ```yaml
 review:
+  max_files: 80
+  max_chunks: 40
   max_llm_chunks: 4
+  max_context_files: 20
+  max_patch_lines_per_chunk: 400
+  large_pr_file_threshold: 30
+  large_pr_line_threshold: 3000
 ```
 
 ```bash
 ai-pr-review PR_URL --no-llm
 ai-pr-review PR_URL --llm-max-chunks 2
+ai-pr-review PR_URL --max-files 80 --max-chunks 40 --max-context-files 20
 ```
+
+Large PR reports include `analysisCoverage` in JSON and an "分析覆盖率" section in Markdown. The coverage
+contains per-file status (`analyzed`, `rule_only`, `skipped`) and highlights high-risk files that were not
+deep analyzed. A low coverage large PR is downgraded to "merge with suggestions" even when no finding is
+detected, because unreviewed files still require human attention.
 
 ## Quality Evaluation
 

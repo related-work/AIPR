@@ -62,6 +62,10 @@ const findingsBySeverity = computed(() => {
   }
   return groups;
 });
+const analysisCoverage = computed(() => parsedReport.value?.analysisCoverage || null);
+const highRiskUnreviewedFiles = computed(() =>
+  (analysisCoverage.value?.fileCoverage || []).filter((item) => item.highRiskUnreviewed)
+);
 const progressEvents = computed(() => props.job?.progress || []);
 
 async function loadInlinePreview() {
@@ -151,6 +155,70 @@ async function loadInlinePreview() {
             <strong>{{ parsedReport.mergeRecommendation }}</strong>
           </article>
         </div>
+
+        <section v-if="analysisCoverage" class="coverage-panel">
+          <div class="report-toolbar">
+            <div>
+              <h3>分析覆盖率</h3>
+              <p>大 PR 会优先分析高风险 chunk，未深度分析的范围会在这里明确展示。</p>
+            </div>
+            <span :class="['coverage-badge', analysisCoverage.largePr ? 'warning' : 'ok']">
+              {{ analysisCoverage.largePr ? "大 PR" : "常规 PR" }}
+            </span>
+          </div>
+          <div class="coverage-grid">
+            <article>
+              <span>深度分析文件</span>
+              <strong>{{ analysisCoverage.analyzedFiles }} / {{ analysisCoverage.changedFiles }}</strong>
+            </article>
+            <article>
+              <span>LLM chunk</span>
+              <strong>{{ analysisCoverage.llmAnalyzedChunks }} / {{ analysisCoverage.totalChunks }}</strong>
+            </article>
+            <article>
+              <span>规则扫描文件</span>
+              <strong>{{ analysisCoverage.rulesScannedFiles }}</strong>
+            </article>
+            <article>
+              <span>覆盖率</span>
+              <strong>{{ Number(analysisCoverage.coverageRatio || 0).toFixed(2) }}</strong>
+            </article>
+          </div>
+          <div v-if="analysisCoverage.budgetLimits" class="coverage-budget">
+            <code v-if="analysisCoverage.budgetLimits.maxFiles">max_files={{ analysisCoverage.budgetLimits.maxFiles }}</code>
+            <code v-if="analysisCoverage.budgetLimits.maxChunks">max_chunks={{ analysisCoverage.budgetLimits.maxChunks }}</code>
+            <code v-if="analysisCoverage.budgetLimits.maxLlmChunks">max_llm_chunks={{ analysisCoverage.budgetLimits.maxLlmChunks }}</code>
+            <code v-if="analysisCoverage.budgetLimits.maxContextFiles">max_context_files={{ analysisCoverage.budgetLimits.maxContextFiles }}</code>
+            <code v-if="analysisCoverage.budgetLimits.maxPatchLinesPerChunk">
+              max_patch_lines_per_chunk={{ analysisCoverage.budgetLimits.maxPatchLinesPerChunk }}
+            </code>
+          </div>
+          <div v-if="analysisCoverage.skippedReasons?.length" class="coverage-reasons">
+            <span v-for="item in analysisCoverage.skippedReasons" :key="item.reason">
+              {{ item.reason }}：{{ item.count }}
+            </span>
+          </div>
+          <div v-if="highRiskUnreviewedFiles.length" class="coverage-file-section">
+            <h4>高风险未深度分析文件</h4>
+            <div class="coverage-file-list">
+              <article v-for="item in highRiskUnreviewedFiles" :key="item.path" class="coverage-file-item warning">
+                <strong>{{ item.path }}</strong>
+                <span>{{ item.status }} · {{ item.reason }} · risk {{ item.riskScore }}</span>
+                <small>{{ item.reasons?.join(", ") }}</small>
+              </article>
+            </div>
+          </div>
+          <details v-if="analysisCoverage.fileCoverage?.length" class="coverage-file-section">
+            <summary>文件覆盖明细</summary>
+            <div class="coverage-file-list">
+              <article v-for="item in analysisCoverage.fileCoverage" :key="item.path" class="coverage-file-item">
+                <strong>{{ item.path }}</strong>
+                <span>{{ item.status }} · {{ item.reason }} · risk {{ item.riskScore }}</span>
+                <small>{{ item.highRiskUnreviewed ? "高风险未深度分析" : item.reasons?.join(", ") }}</small>
+              </article>
+            </div>
+          </details>
+        </section>
 
         <section class="finding-section" v-for="severity in ['critical', 'high', 'medium', 'low']" :key="severity">
           <h3>{{ severity }}</h3>
