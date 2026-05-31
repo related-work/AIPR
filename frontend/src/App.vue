@@ -1,10 +1,11 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
-import { FileText, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
+import { FileText, History, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
 
 import AppShell from "./components/AppShell.vue";
 import CommandModal from "./components/CommandModal.vue";
 import HelpPanel from "./components/HelpPanel.vue";
+import HistoryPanel from "./components/HistoryPanel.vue";
 import RepoBrowser from "./components/RepoBrowser.vue";
 import ReportViewer from "./components/ReportViewer.vue";
 import ReviewRunner from "./components/ReviewRunner.vue";
@@ -44,12 +45,23 @@ const showCommand = ref(false);
 const copied = ref(false);
 const job = ref(null);
 const runError = ref("");
+const historyJobs = ref([]);
+const historyError = ref("");
+const loadingHistory = ref(false);
 const pollingTimer = ref(null);
+const historyFilters = reactive({
+  query: "",
+  status: "",
+  repo: "",
+  from: "",
+  to: ""
+});
 
 const navItems = [
   { id: "browse", label: "PR 浏览", icon: SearchCode },
   { id: "review", label: "Review 运行", icon: Play },
   { id: "report", label: "报告结果", icon: FileText },
+  { id: "history", label: "历史记录", icon: History },
   { id: "settings", label: "本地配置", icon: ShieldCheck },
   { id: "help", label: "帮助", icon: Settings2 }
 ];
@@ -295,6 +307,20 @@ function requestPayload() {
   };
 }
 
+function applyRequest(request) {
+  form.prUrl = request.prUrl || form.prUrl;
+  form.format = request.format || form.format;
+  form.model = request.model || form.model;
+  form.failOn = request.failOn || "";
+  form.postComment = Boolean(request.postComment);
+  form.postInlineComments = Boolean(request.postInlineComments);
+  form.changedOnly = Boolean(request.changedOnly);
+  form.withContext = Boolean(request.withContext);
+  form.noLlm = Boolean(request.noLlm);
+  form.llmMaxChunks = request.llmMaxChunks || form.llmMaxChunks;
+  form.debugChunks = Boolean(request.debugChunks);
+}
+
 async function runReview() {
   if (urlError.value || isRunning.value) {
     return;
@@ -319,6 +345,113 @@ async function runReview() {
   }
 }
 
+async function loadHistory() {
+  historyError.value = "";
+  loadingHistory.value = true;
+  try {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(historyFilters)) {
+      if (value) {
+        params.set(key, value);
+      }
+    }
+    const queryString = params.toString();
+    const response = await fetch(`/api/reviews${queryString ? `?${queryString}` : ""}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取历史失败");
+    }
+    historyJobs.value = payload.jobs || [];
+  } catch (error) {
+    historyError.value = error.message;
+  } finally {
+    loadingHistory.value = false;
+  }
+}
+
+async function deleteHistoryJob(historyJob) {
+  if (!window.confirm(`删除这条 Review 历史？\n${historyJob.request.prUrl}`)) {
+    return;
+  }
+  historyError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${encodeURIComponent(historyJob.id)}`, {
+      method: "DELETE"
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "删除历史失败");
+    }
+    if (job.value?.id === historyJob.id) {
+      job.value = null;
+    }
+    await loadHistory();
+  } catch (error) {
+    historyError.value = error.message;
+  }
+}
+
+async function clearHistory() {
+  if (!window.confirm("清空所有已完成的 Review 历史？运行中的任务会保留。")) {
+    return;
+  }
+  historyError.value = "";
+  try {
+    const response = await fetch("/api/reviews", { method: "DELETE" });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "清空历史失败");
+    }
+    await loadHistory();
+  } catch (error) {
+    historyError.value = error.message;
+  }
+}
+
+function exportHistoryJob(historyJob, format) {
+  const extension = format === "json" ? "json" : "md";
+  const link = document.createElement("a");
+  link.href = `/api/reviews/${encodeURIComponent(historyJob.id)}/export?format=${encodeURIComponent(format)}`;
+  link.download = `ai-pr-review-${historyJob.id}.${extension}`;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function updateHistoryFilter({ key, value }) {
+  if (Object.prototype.hasOwnProperty.call(historyFilters, key)) {
+    historyFilters[key] = value;
+  }
+}
+
+async function viewHistoryJob(historyJob) {
+  historyError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${historyJob.id}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取历史报告失败");
+    }
+    job.value = payload;
+    activeView.value = "report";
+  } catch (error) {
+    historyError.value = error.message;
+  }
+}
+
+function rerunHistoryJob(historyJob) {
+  applyRequest(historyJob.request);
+  activeView.value = "review";
+}
+
+function navigate(view) {
+  activeView.value = view;
+  if (view === "history") {
+    loadHistory();
+  }
+}
+
 function pollJob(jobId) {
   window.clearInterval(pollingTimer.value);
   pollingTimer.value = window.setInterval(async () => {
@@ -331,6 +464,7 @@ function pollJob(jobId) {
       job.value = payload;
       if (!["queued", "running"].includes(payload.status)) {
         window.clearInterval(pollingTimer.value);
+        loadHistory();
       }
     } catch (error) {
       runError.value = error.message;
@@ -350,7 +484,7 @@ onBeforeUnmount(() => {
     :is-running="isRunning"
     :nav-items="navItems"
     :selected-pr-label="selectedPrLabel"
-    @navigate="activeView = $event"
+    @navigate="navigate"
     @open-command="showCommand = true"
   >
     <RepoBrowser
@@ -392,6 +526,21 @@ onBeforeUnmount(() => {
       :output-text="outputText"
       :run-error="runError"
       @go-runner="activeView = 'review'"
+    />
+
+    <HistoryPanel
+      v-else-if="activeView === 'history'"
+      :history-filters="historyFilters"
+      :history-error="historyError"
+      :history-jobs="historyJobs"
+      :loading-history="loadingHistory"
+      @clear="clearHistory"
+      @delete-job="deleteHistoryJob"
+      @export-job="exportHistoryJob"
+      @refresh="loadHistory"
+      @rerun-job="rerunHistoryJob"
+      @update-filter="updateHistoryFilter"
+      @view-job="viewHistoryJob"
     />
 
     <SettingsPanel
