@@ -1,11 +1,12 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
-import { FileText, History, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
+import { Activity, FileText, History, Play, SearchCode, Settings2, ShieldCheck } from "@lucide/vue";
 
 import AppShell from "./components/AppShell.vue";
 import CommandModal from "./components/CommandModal.vue";
 import HelpPanel from "./components/HelpPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
+import QualityEvalPanel from "./components/QualityEvalPanel.vue";
 import RepoBrowser from "./components/RepoBrowser.vue";
 import ReportViewer from "./components/ReportViewer.vue";
 import ReviewRunner from "./components/ReviewRunner.vue";
@@ -49,6 +50,19 @@ const historyJobs = ref([]);
 const historyError = ref("");
 const loadingHistory = ref(false);
 const pollingTimer = ref(null);
+const qualityEvaluation = ref(null);
+const qualityError = ref("");
+const loadingQuality = ref(false);
+const qualityFixture = ref("all");
+const qualitySnapshots = ref([]);
+const qualitySnapshotError = ref("");
+const loadingQualitySnapshots = ref(false);
+const savingQualitySnapshot = ref(false);
+const qualitySnapshotLabel = ref("");
+const qualityCompareBase = ref("");
+const qualityCompareTarget = ref("");
+const qualityComparison = ref(null);
+const qualityComparisonError = ref("");
 const historyFilters = reactive({
   query: "",
   status: "",
@@ -62,6 +76,7 @@ const navItems = [
   { id: "review", label: "Review 运行", icon: Play },
   { id: "report", label: "报告结果", icon: FileText },
   { id: "history", label: "历史记录", icon: History },
+  { id: "quality", label: "质量评测", icon: Activity },
   { id: "settings", label: "本地配置", icon: ShieldCheck },
   { id: "help", label: "帮助", icon: Settings2 }
 ];
@@ -425,6 +440,112 @@ function updateHistoryFilter({ key, value }) {
   }
 }
 
+async function runQualityEvaluation() {
+  if (loadingQuality.value) {
+    return;
+  }
+  qualityError.value = "";
+  loadingQuality.value = true;
+  try {
+    const response = await fetch(`/api/quality-evaluation?fixture=${encodeURIComponent(qualityFixture.value)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "运行质量评测失败");
+    }
+    qualityEvaluation.value = payload;
+  } catch (error) {
+    qualityError.value = error.message;
+  } finally {
+    loadingQuality.value = false;
+  }
+}
+
+async function loadQualitySnapshots() {
+  qualitySnapshotError.value = "";
+  loadingQualitySnapshots.value = true;
+  try {
+    const response = await fetch("/api/quality-evaluation/snapshots");
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取评测快照失败");
+    }
+    qualitySnapshots.value = payload.snapshots || [];
+    if (!qualityCompareTarget.value && qualitySnapshots.value[0]) {
+      qualityCompareTarget.value = qualitySnapshots.value[0].id;
+    }
+    if (!qualityCompareBase.value && qualitySnapshots.value[1]) {
+      qualityCompareBase.value = qualitySnapshots.value[1].id;
+    }
+  } catch (error) {
+    qualitySnapshotError.value = error.message;
+  } finally {
+    loadingQualitySnapshots.value = false;
+  }
+}
+
+async function saveQualitySnapshot() {
+  if (savingQualitySnapshot.value) {
+    return;
+  }
+  qualitySnapshotError.value = "";
+  savingQualitySnapshot.value = true;
+  try {
+    const response = await fetch("/api/quality-evaluation/snapshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fixture: qualityFixture.value,
+        label: qualitySnapshotLabel.value || null
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "保存评测快照失败");
+    }
+    qualitySnapshotLabel.value = "";
+    await loadQualitySnapshots();
+    qualityCompareTarget.value = payload.id;
+  } catch (error) {
+    qualitySnapshotError.value = error.message;
+  } finally {
+    savingQualitySnapshot.value = false;
+  }
+}
+
+async function compareQualitySnapshots() {
+  if (!qualityCompareBase.value || !qualityCompareTarget.value) {
+    qualityComparisonError.value = "请选择两个快照";
+    return;
+  }
+  qualityComparisonError.value = "";
+  try {
+    const response = await fetch(
+      `/api/quality-evaluation/snapshots/compare?base=${encodeURIComponent(
+        qualityCompareBase.value
+      )}&target=${encodeURIComponent(qualityCompareTarget.value)}`
+    );
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "比较评测快照失败");
+    }
+    qualityComparison.value = payload;
+  } catch (error) {
+    qualityComparisonError.value = error.message;
+  }
+}
+
+function updateQualitySnapshotLabel(value) {
+  qualitySnapshotLabel.value = value;
+}
+
+function updateQualityCompareBase(value) {
+  qualityCompareBase.value = value;
+}
+
+function updateQualityCompareTarget(value) {
+  qualityCompareTarget.value = value;
+}
+
 async function viewHistoryJob(historyJob) {
   historyError.value = "";
   try {
@@ -449,6 +570,12 @@ function navigate(view) {
   activeView.value = view;
   if (view === "history") {
     loadHistory();
+  }
+  if (view === "quality" && !qualityEvaluation.value) {
+    runQualityEvaluation();
+  }
+  if (view === "quality" && !qualitySnapshots.value.length) {
+    loadQualitySnapshots();
   }
 }
 
@@ -541,6 +668,30 @@ onBeforeUnmount(() => {
       @rerun-job="rerunHistoryJob"
       @update-filter="updateHistoryFilter"
       @view-job="viewHistoryJob"
+    />
+
+    <QualityEvalPanel
+      v-else-if="activeView === 'quality'"
+      v-model:fixture="qualityFixture"
+      :comparison="qualityComparison"
+      :comparison-error="qualityComparisonError"
+      :compare-base="qualityCompareBase"
+      :compare-target="qualityCompareTarget"
+      :evaluation="qualityEvaluation"
+      :evaluation-error="qualityError"
+      :loading-evaluation="loadingQuality"
+      :loading-snapshots="loadingQualitySnapshots"
+      :saving-snapshot="savingQualitySnapshot"
+      :snapshot-error="qualitySnapshotError"
+      :snapshot-label="qualitySnapshotLabel"
+      :snapshots="qualitySnapshots"
+      @compare-snapshots="compareQualitySnapshots"
+      @refresh-snapshots="loadQualitySnapshots"
+      @run="runQualityEvaluation"
+      @save-snapshot="saveQualitySnapshot"
+      @update:compare-base="updateQualityCompareBase"
+      @update:compare-target="updateQualityCompareTarget"
+      @update:snapshot-label="updateQualitySnapshotLabel"
     />
 
     <SettingsPanel

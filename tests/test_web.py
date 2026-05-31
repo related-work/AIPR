@@ -14,9 +14,14 @@ from ai_pr_review.web import (
     github_pulls_payload,
     github_repos_payload,
     inline_preview_payload,
+    quality_snapshot_compare_payload,
+    quality_snapshot_list_payload,
+    quality_snapshot_save_payload,
+    quality_evaluation_payload,
 )
 from ai_pr_review.config import ReviewConfig
 from ai_pr_review.progress import PROGRESS_FILE_ENV, ProgressReporter
+from ai_pr_review.quality_eval import QualitySnapshotStore, evaluate_builtin_fixtures
 
 
 def test_build_cli_args_includes_review_options() -> None:
@@ -563,6 +568,49 @@ def test_doctor_payload_returns_config_status_without_secret_values() -> None:
     assert "ghp_secret" not in serialized
     assert "sk_secret" not in serialized
     assert "one-api.example.com" not in serialized
+
+
+def test_quality_evaluation_payload_returns_all_fixture_results() -> None:
+    payload = quality_evaluation_payload("all")
+
+    assert payload["total"] == 4
+    assert payload["passed"] == 4
+    assert payload["falsePositives"] == 0
+    assert payload["falseNegatives"] == 0
+    assert {result["kind"] for result in payload["results"]} == {
+        "high_quality",
+        "low_quality",
+        "harmful",
+        "clean",
+    }
+
+
+def test_quality_evaluation_payload_can_run_one_fixture() -> None:
+    payload = quality_evaluation_payload("harmful_pr")
+
+    assert payload["total"] == 1
+    assert payload["passed"] == 1
+    assert payload["results"][0]["fixtureId"] == "harmful_pr"
+
+
+def test_quality_snapshot_payloads_save_list_and_compare(tmp_path) -> None:
+    store = QualitySnapshotStore(tmp_path)
+    baseline = quality_snapshot_save_payload(store, fixture_id="all", label="baseline")
+    target_report = evaluate_builtin_fixtures()
+    target_snapshot = store.save(target_report, label="same-result")
+
+    list_payload = quality_snapshot_list_payload(store)
+    comparison = quality_snapshot_compare_payload(
+        store,
+        base_id=baseline["id"],
+        target_id=target_snapshot.id,
+    )
+
+    assert list_payload["snapshots"][0]["label"] == "same-result"
+    assert list_payload["snapshots"][1]["label"] == "baseline"
+    assert comparison["baseId"] == baseline["id"]
+    assert comparison["targetId"] == target_snapshot.id
+    assert comparison["deltaPassed"] == 0
 
 
 def _write_history_job(

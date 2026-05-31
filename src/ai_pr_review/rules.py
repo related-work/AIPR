@@ -33,7 +33,7 @@ def run_rules(
 
     findings.extend(_scan_manifest_lock_consistency(changed_paths))
     findings.extend(_scan_migration_risk(changed_paths, diff_by_path))
-    findings.extend(_scan_required_tests(changed_paths, config))
+    findings.extend(_scan_required_tests(changed_paths, config, diff_by_path))
     return findings
 
 
@@ -202,10 +202,18 @@ def _scan_migration_risk(
     return []
 
 
-def _scan_required_tests(changed_paths: list[str], config: ReviewConfig) -> list[Finding]:
+def _scan_required_tests(
+    changed_paths: list[str],
+    config: ReviewConfig,
+    diff_by_path: dict[str, DiffFile],
+) -> list[Finding]:
     if not config.rules.require_tests_for:
         return []
-    test_changed = any(_is_test_path(path) for path in changed_paths)
+    test_changed = any(
+        _is_meaningful_test_change(path, diff_by_path.get(path))
+        for path in changed_paths
+        if _is_test_path(path)
+    )
     if test_changed:
         return []
     findings: list[Finding] = []
@@ -229,6 +237,26 @@ def _scan_required_tests(changed_paths: list[str], config: ReviewConfig) -> list
                 )
             )
     return findings
+
+
+def _is_meaningful_test_change(path: str, diff_file: DiffFile | None) -> bool:
+    if diff_file is None or not _is_test_path(path):
+        return False
+    added = [
+        line
+        for hunk in diff_file.hunks
+        for line in hunk.lines
+        if line.kind == "add" and line.content[1:].strip()
+    ]
+    removed = [
+        line
+        for hunk in diff_file.hunks
+        for line in hunk.lines
+        if line.kind == "remove"
+    ]
+    if not added:
+        return False
+    return not _has_weakened_assertion(removed, added)
 
 
 def _is_test_path(path: str) -> bool:

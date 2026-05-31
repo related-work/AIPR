@@ -13,6 +13,9 @@ The project currently provides:
 - Process-local and persisted review history under `.ai-pr-review/runs/`.
 - CLI-to-Web review progress events with a report-page timeline.
 - Local history management with filtering, deletion, clearing, and Markdown/JSON export.
+- Deterministic `ai-pr-review eval` fixtures for high-quality, low-quality, harmful, and clean PR examples.
+- Web quality evaluation view backed by the same deterministic local fixtures.
+- Local quality evaluation snapshots and baseline comparison.
 
 The backend is local-first. It reads credentials from environment variables or `.ai-pr-review.local.yml`; secrets are not sent to the browser.
 
@@ -112,20 +115,20 @@ This turns prompt/rule/model changes into measurable engineering work.
 
 Implement:
 
-1. Review quality evaluation fixtures.
-2. Regression scoring for prompt/rule/model changes.
+1. Expand quality evaluation coverage to LLM/verifier outputs.
+2. Add CI-friendly quality gate based on evaluation snapshots.
 
 Scope constraints:
 
 - Do not add a database.
 - Keep fixture tests deterministic and network-free.
-- Cover high-quality, low-quality, harmful, and clean PR examples.
+- Keep default evaluation rules-only unless explicitly configured.
 - Track expected findings without requiring exact model wording.
 - Keep all secrets backend-only.
 
 Expected commits:
 
 ```text
-test: add review quality fixture set
-feat: add review quality regression runner
+test: expand review quality fixtures
+feat: add quality evaluation ci gate
 ```

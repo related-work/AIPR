@@ -583,6 +583,136 @@ h1 {
   gap: 10px;
 }
 
+.quality-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.quality-controls {
+  min-width: min(280px, 100%);
+}
+
+.quality-run-button {
+  width: auto;
+}
+
+.quality-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.quality-results {
+  display: grid;
+  gap: 10px;
+}
+
+.quality-result {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 12px;
+}
+
+.snapshot-actions,
+.snapshot-compare {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.snapshot-compare {
+  grid-template-columns: repeat(2, minmax(180px, 1fr)) auto;
+}
+
+.snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.snapshot-card {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 11px;
+}
+
+.snapshot-card strong {
+  color: #111827;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.snapshot-card span,
+.snapshot-card small,
+.quality-panel p {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.comparison-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.quality-result header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.quality-result header span,
+.quality-result small {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.quality-result p {
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.quality-rule-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.quality-rule-grid div {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 9px;
+}
+
+.quality-rule-grid span {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.quality-rule-grid code {
+  color: #0f766e;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .history-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1282,6 +1412,11 @@ h1 {
   .split-grid,
   .settings-grid,
   .doctor-grid,
+  .quality-summary,
+  .quality-rule-grid,
+  .snapshot-grid,
+  .snapshot-compare,
+  .comparison-summary,
   .template-panel,
   .docs-panel {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1310,6 +1445,12 @@ h1 {
   .action-row,
   .history-filters,
   .settings-grid,
+  .quality-summary,
+  .quality-rule-grid,
+  .snapshot-actions,
+  .snapshot-grid,
+  .snapshot-compare,
+  .comparison-summary,
   .template-panel,
   .docs-panel,
   .command-box {
