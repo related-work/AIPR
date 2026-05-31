@@ -17,7 +17,13 @@ class ReviewSettings(BaseModel):
     fail_on: str | None = None
     ignore_paths: list[str] = Field(default_factory=list)
     high_risk_paths: list[str] = Field(default_factory=list)
+    max_files: int | None = None
+    max_chunks: int | None = None
     max_llm_chunks: int | None = None
+    max_context_files: int | None = None
+    max_patch_lines_per_chunk: int | None = None
+    large_pr_file_threshold: int = 30
+    large_pr_line_threshold: int = 3000
 
 
 class RuleSettings(BaseModel):

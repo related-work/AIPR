@@ -51,6 +51,76 @@ def render_markdown(report: ReviewReport) -> str:
                 f"{location} | {_escape_table(', '.join(item.reasons))} |"
             )
 
+    coverage = report.analysis_coverage
+    lines.extend(
+        [
+            "",
+            "## 分析覆盖率",
+            "",
+            f"- 大 PR：{'是' if coverage.large_pr else '否'}",
+            f"- 变更文件：{coverage.changed_files}",
+            f"- 深度分析文件：{coverage.analyzed_files} / {coverage.changed_files}",
+            f"- 规则扫描文件：{coverage.rules_scanned_files}",
+            f"- LLM 分析 chunk：{coverage.llm_analyzed_chunks} / {coverage.total_chunks}",
+            f"- 覆盖率：{coverage.coverage_ratio:.2f}",
+        ]
+    )
+    if coverage.budget_limits.model_dump(exclude_none=True):
+        lines.extend(
+            [
+                "",
+                "| 预算项 | 值 |",
+                "|---|---:|",
+            ]
+        )
+        budget_labels = [
+            ("max_files", "max_files"),
+            ("max_chunks", "max_chunks"),
+            ("max_llm_chunks", "max_llm_chunks"),
+            ("max_context_files", "max_context_files"),
+            ("max_patch_lines_per_chunk", "max_patch_lines_per_chunk"),
+        ]
+        for key, label in budget_labels:
+            value = getattr(coverage.budget_limits, key)
+            if value is not None:
+                lines.append(f"| {label} | {value} |")
+    if coverage.skipped_reasons:
+        lines.extend(["", "跳过/未深度分析原因："])
+        lines.extend(f"- {item.reason}：{item.count}" for item in coverage.skipped_reasons)
+    high_risk_unreviewed = [
+        item for item in coverage.file_coverage if item.high_risk_unreviewed
+    ]
+    if high_risk_unreviewed:
+        lines.extend(
+            [
+                "",
+                "### 高风险未深度分析文件",
+                "",
+                "| 文件 | 状态 | 原因 | 风险分 | 风险信号 |",
+                "|---|---|---|---:|---|",
+            ]
+        )
+        for item in high_risk_unreviewed:
+            lines.append(
+                f"| {item.path} | {item.status} | {item.reason} | "
+                f"{item.risk_score} | {_escape_table(', '.join(item.reasons))} |"
+            )
+    if coverage.file_coverage:
+        lines.extend(
+            [
+                "",
+                "### 文件覆盖明细",
+                "",
+                "| 文件 | 状态 | 原因 | 风险分 | 高风险未深度分析 |",
+                "|---|---|---|---:|---|",
+            ]
+        )
+        for item in coverage.file_coverage:
+            lines.append(
+                f"| {item.path} | {item.status} | {item.reason} | "
+                f"{item.risk_score} | {'是' if item.high_risk_unreviewed else '否'} |"
+            )
+
     risk = report.risk_overview
     lines.extend(
         [
@@ -133,6 +203,7 @@ def render_json(report: ReviewReport) -> str:
         },
         "scope": [item.model_dump() for item in report.scope],
         "chunkDebug": [item.model_dump() for item in report.chunk_debug],
+        "analysisCoverage": report.analysis_coverage.model_dump(by_alias=True),
         "commentContext": {
             "issueComments": report.comment_context.issue_comments,
             "reviewComments": report.comment_context.review_comments,

@@ -1,0 +1,1905 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from datetime import UTC, date, datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Callable, Literal
+from urllib.parse import parse_qs, unquote, urlparse
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from ai_pr_review.config import (
+    ReviewConfig,
+    load_config,
+    resolve_github_token,
+    resolve_openai_api_key,
+    resolve_openai_api_mode,
+    resolve_openai_base_url,
+)
+from ai_pr_review.diff_parser import parse_diff
+from ai_pr_review.doctor import SmokeTester, run_doctor as run_doctor_report
+from ai_pr_review.github import GitHubAPIError, GitHubClient, PRUrlError, parse_pr_url
+from ai_pr_review.inline_comments import build_inline_review_comments
+from ai_pr_review.progress import PROGRESS_FILE_ENV, ProgressEvent, ProgressStatus, read_progress_events
+from ai_pr_review.quality_eval import QualitySnapshotStore, evaluate_builtin_fixtures
+from ai_pr_review.schemas import Finding
+
+
+JobStatus = Literal["queued", "running", "succeeded", "failed"]
+BatchItemStatus = Literal["pending", "running", "succeeded", "failed", "skipped"]
+WatcherStatus = Literal["paused", "running", "failed"]
+RiskLevel = Literal["critical", "high", "medium", "low", "unknown"]
+Executor = Callable[[list[str], Path, dict[str, str]], subprocess.CompletedProcess[str]]
+ReviewStarter = Callable[[object], object]
+GitHubFactory = Callable[[], object]
+OWNER_REPO_PATTERN = r"^[A-Za-z0-9_.-]+$"
+
+
+class ReviewRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    pr_url: str = Field(alias="prUrl")
+    output_format: Literal["markdown", "json"] = Field(default="markdown", alias="format")
+    post_comment: bool = Field(default=False, alias="postComment")
+    post_inline_comments: bool = Field(default=False, alias="postInlineComments")
+    fail_on: Literal["critical", "high", "medium", "low"] | None = Field(
+        default=None,
+        alias="failOn",
+    )
+    model_profile: Literal["fast", "balanced", "accurate"] = Field(
+        default="balanced",
+        alias="model",
+    )
+    changed_only: bool = Field(default=False, alias="changedOnly")
+    with_context: bool = Field(default=False, alias="withContext")
+    no_llm: bool = Field(default=False, alias="noLlm")
+    llm_max_chunks: int | None = Field(default=None, ge=1, le=50, alias="llmMaxChunks")
+    max_files: int | None = Field(default=None, ge=1, le=500, alias="maxFiles")
+    max_chunks: int | None = Field(default=None, ge=1, le=1000, alias="maxChunks")
+    max_context_files: int | None = Field(default=None, ge=1, le=200, alias="maxContextFiles")
+    max_patch_lines_per_chunk: int | None = Field(
+        default=None,
+        ge=20,
+        le=2000,
+        alias="maxPatchLinesPerChunk",
+    )
+    debug_chunks: bool = Field(default=False, alias="debugChunks")
+
+    @field_validator("pr_url")
+    @classmethod
+    def validate_pr_url(cls, value: str) -> str:
+        try:
+            parse_pr_url(value)
+        except PRUrlError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class ReviewJob(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    status: JobStatus
+    command: str
+    request: ReviewRunRequest
+    created_at: str = Field(alias="createdAt")
+    started_at: str | None = Field(default=None, alias="startedAt")
+    finished_at: str | None = Field(default=None, alias="finishedAt")
+    exit_code: int | None = Field(default=None, alias="exitCode")
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+    progress: list[ProgressEvent] = Field(default_factory=list)
+
+
+class BatchReviewRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    requests: list[ReviewRunRequest] = Field(min_length=1, max_length=50)
+
+
+class BatchReviewItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    pr_url: str = Field(alias="prUrl")
+    title: str = ""
+    number: int | None = None
+    job_id: str | None = Field(default=None, alias="jobId")
+    status: BatchItemStatus = "pending"
+    risk: RiskLevel = "unknown"
+    merge_recommendation: str | None = Field(default=None, alias="mergeRecommendation")
+    blocking_findings: int = Field(default=0, alias="blockingFindings")
+    coverage_ratio: float | None = Field(default=None, alias="coverageRatio")
+    error: str | None = None
+
+
+class BatchReviewJob(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    status: JobStatus
+    created_at: str = Field(alias="createdAt")
+    started_at: str | None = Field(default=None, alias="startedAt")
+    finished_at: str | None = Field(default=None, alias="finishedAt")
+    total: int
+    completed: int = 0
+    failed: int = 0
+    items: list[BatchReviewItem]
+
+
+class WatcherRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    repo: str
+    state: Literal["open", "all"] = "open"
+    interval_seconds: int = Field(default=300, ge=10, le=86_400, alias="intervalSeconds")
+    include_drafts: bool = Field(default=False, alias="includeDrafts")
+    model_profile: Literal["fast", "balanced", "accurate"] = Field(default="fast", alias="model")
+    changed_only: bool = Field(default=True, alias="changedOnly")
+    with_context: bool = Field(default=False, alias="withContext")
+    no_llm: bool = Field(default=False, alias="noLlm")
+    llm_max_chunks: int | None = Field(default=2, ge=1, le=50, alias="llmMaxChunks")
+    max_files: int | None = Field(default=80, ge=1, le=500, alias="maxFiles")
+    max_chunks: int | None = Field(default=40, ge=1, le=1000, alias="maxChunks")
+    max_context_files: int | None = Field(default=20, ge=1, le=200, alias="maxContextFiles")
+    max_patch_lines_per_chunk: int | None = Field(default=400, ge=20, le=2000, alias="maxPatchLinesPerChunk")
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def validate_owner_repo(cls, value: str) -> str:
+        if not _valid_owner_or_repo(value):
+            raise ValueError("owner/repo 只能包含 GitHub 仓库名允许的字符")
+        return value
+
+
+class WatcherTriggeredReview(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    pr_number: int = Field(alias="prNumber")
+    pr_url: str = Field(alias="prUrl")
+    title: str = ""
+    head_sha: str = Field(alias="headSha")
+    job_id: str | None = Field(default=None, alias="jobId")
+    triggered_at: str = Field(alias="triggeredAt")
+
+
+class WatcherJob(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    status: WatcherStatus = "paused"
+    request: WatcherRunRequest
+    created_at: str = Field(alias="createdAt")
+    started_at: str | None = Field(default=None, alias="startedAt")
+    last_checked_at: str | None = Field(default=None, alias="lastCheckedAt")
+    last_error: str | None = Field(default=None, alias="lastError")
+    triggered: int = 0
+    seen_heads: dict[int, str] = Field(default_factory=dict, alias="seenHeads")
+    recent_reviews: list[WatcherTriggeredReview] = Field(default_factory=list, alias="recentReviews")
+
+
+def build_cli_args(request: ReviewRunRequest) -> list[str]:
+    args = [
+        request.pr_url,
+        "--format",
+        request.output_format,
+        "--model",
+        request.model_profile,
+    ]
+    if request.post_comment:
+        args.append("--post-comment")
+    if request.post_inline_comments:
+        args.append("--post-inline-comments")
+    if request.fail_on:
+        args.extend(["--fail-on", request.fail_on])
+    if request.changed_only:
+        args.append("--changed-only")
+    if request.with_context:
+        args.append("--with-context")
+    if request.no_llm:
+        args.append("--no-llm")
+    if request.llm_max_chunks is not None:
+        args.extend(["--llm-max-chunks", str(request.llm_max_chunks)])
+    if request.max_files is not None:
+        args.extend(["--max-files", str(request.max_files)])
+    if request.max_chunks is not None:
+        args.extend(["--max-chunks", str(request.max_chunks)])
+    if request.max_context_files is not None:
+        args.extend(["--max-context-files", str(request.max_context_files)])
+    if request.max_patch_lines_per_chunk is not None:
+        args.extend(["--max-patch-lines-per-chunk", str(request.max_patch_lines_per_chunk)])
+    if request.debug_chunks:
+        args.append("--debug-chunks")
+    return args
+
+
+def display_command(request: ReviewRunRequest) -> str:
+    return "ai-pr-review " + " ".join(shlex.quote(arg) for arg in build_cli_args(request))
+
+
+def github_repos_payload(owner: str, github: object) -> dict:
+    repos = []
+    for repo in github.list_owner_repositories(owner):  # type: ignore[attr-defined]
+        repos.append(
+            {
+                "name": str(repo.get("name") or ""),
+                "fullName": str(repo.get("full_name") or ""),
+                "private": bool(repo.get("private")),
+                "archived": bool(repo.get("archived")),
+                "defaultBranch": str(repo.get("default_branch") or ""),
+                "openIssues": int(repo.get("open_issues_count") or 0),
+                "updatedAt": str(repo.get("updated_at") or ""),
+                "url": str(repo.get("html_url") or ""),
+            }
+        )
+    repos.sort(key=lambda item: (item["archived"], item["updatedAt"]), reverse=False)
+    repos.sort(key=lambda item: item["updatedAt"], reverse=True)
+    repos.sort(key=lambda item: item["archived"])
+    return {"owner": owner, "repos": repos}
+
+
+def github_pulls_payload(owner: str, repo: str, state: str, github: object) -> dict:
+    pulls = []
+    for pull in github.list_repository_pulls(owner, repo, state=state):  # type: ignore[attr-defined]
+        user = pull.get("user") if isinstance(pull.get("user"), dict) else {}
+        pulls.append(
+            {
+                "number": int(pull.get("number") or 0),
+                "title": str(pull.get("title") or ""),
+                "url": str(pull.get("html_url") or ""),
+                "author": str(user.get("login") or ""),
+                "state": str(pull.get("state") or ""),
+                "updatedAt": str(pull.get("updated_at") or ""),
+            }
+        )
+    return {"owner": owner, "repo": repo, "state": state, "pulls": pulls}
+
+
+def inline_preview_payload(report_output: str, raw_diff: str) -> dict:
+    try:
+        payload = json.loads(report_output)
+    except ValueError:
+        return _empty_inline_preview("当前报告不是 JSON 输出，无法生成结构化 inline 预览")
+    if not isinstance(payload, dict):
+        return _empty_inline_preview("当前报告 JSON 结构无效，无法生成 inline 预览")
+    findings_payload = payload.get("findings")
+    if not isinstance(findings_payload, list):
+        return _empty_inline_preview("当前报告缺少 findings，无法生成 inline 预览")
+
+    findings: list[Finding] = []
+    for item in findings_payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            findings.append(Finding.model_validate(item))
+        except ValidationError:
+            continue
+
+    comments, limitations = build_inline_review_comments(findings, parse_diff(raw_diff))
+    preview_comments = []
+    for comment in comments:
+        finding = _finding_for_comment(findings, comment)
+        preview_comments.append(
+            {
+                "path": comment["path"],
+                "line": comment["line"],
+                "side": comment["side"],
+                "body": comment["body"],
+                "severity": finding.severity,
+                "category": finding.category,
+                "confidence": finding.confidence,
+            }
+        )
+    return {
+        "comments": preview_comments,
+        "commentableCount": len(comments),
+        "skippedCount": max(0, len(findings) - len(comments)),
+        "limitations": limitations,
+    }
+
+
+def _empty_inline_preview(message: str) -> dict:
+    return {
+        "comments": [],
+        "commentableCount": 0,
+        "skippedCount": 0,
+        "limitations": [message],
+    }
+
+
+def _finding_for_comment(findings: list[Finding], comment: dict) -> Finding:
+    for finding in findings:
+        if finding.path == comment["path"] and finding.line == comment["line"]:
+            return finding
+    raise ValueError("inline comment does not match a finding")
+
+
+def diff_preview_payload(raw_diff: str, report_output: str = "") -> dict:
+    diff_files = parse_diff(raw_diff)
+    findings_by_location = _findings_by_location(report_output)
+    files = []
+    total_additions = 0
+    total_deletions = 0
+    findings_mapped = 0
+
+    for diff_file in diff_files:
+        file_additions = 0
+        file_deletions = 0
+        hunks = []
+        for hunk in diff_file.hunks:
+            lines = []
+            for line in hunk.lines:
+                if line.kind == "add":
+                    file_additions += 1
+                    total_additions += 1
+                elif line.kind == "remove":
+                    file_deletions += 1
+                    total_deletions += 1
+                line_findings = _line_findings(
+                    findings_by_location,
+                    diff_file.path,
+                    line.new_line_no,
+                )
+                findings_mapped += len(line_findings)
+                lines.append(
+                    {
+                        "kind": line.kind,
+                        "content": line.content,
+                        "oldLine": line.old_line_no,
+                        "newLine": line.new_line_no,
+                        "findings": line_findings,
+                    }
+                )
+            hunks.append(
+                {
+                    "oldStart": hunk.old_start,
+                    "oldLength": hunk.old_length,
+                    "newStart": hunk.new_start,
+                    "newLength": hunk.new_length,
+                    "sectionHeader": hunk.section_header,
+                    "lines": lines,
+                }
+            )
+        files.append(
+            {
+                "path": diff_file.path,
+                "oldPath": diff_file.old_path,
+                "status": diff_file.status,
+                "additions": file_additions,
+                "deletions": file_deletions,
+                "hunks": hunks,
+            }
+        )
+
+    return {
+        "files": files,
+        "fileCount": len(files),
+        "totalAdditions": total_additions,
+        "totalDeletions": total_deletions,
+        "findingsMapped": findings_mapped,
+        "limitations": [],
+    }
+
+
+def _findings_by_location(report_output: str) -> dict[tuple[str, int], list[Finding]]:
+    if not report_output.strip():
+        return {}
+    try:
+        payload = json.loads(report_output)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+        return {}
+    findings_by_location: dict[tuple[str, int], list[Finding]] = {}
+    for item in payload["findings"]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            finding = Finding.model_validate(item)
+        except ValidationError:
+            continue
+        if finding.line is None:
+            continue
+        findings_by_location.setdefault((finding.path, finding.line), []).append(finding)
+    return findings_by_location
+
+
+def _line_findings(
+    findings_by_location: dict[tuple[str, int], list[Finding]],
+    path: str,
+    new_line_no: int | None,
+) -> list[dict]:
+    if new_line_no is None:
+        return []
+    return [
+        {
+            "severity": finding.severity,
+            "category": finding.category,
+            "confidence": finding.confidence,
+            "problem": finding.problem,
+            "suggestion": finding.suggestion,
+            "blocking": finding.blocking,
+        }
+        for finding in findings_by_location.get((path, new_line_no), [])
+    ]
+
+
+def doctor_payload(
+    *,
+    config: ReviewConfig,
+    github_token: str | None,
+    openai_api_key: str | None,
+    openai_base_url: str | None,
+    api_mode: str,
+    model_profile: str,
+    smoke: bool,
+    smoke_tester: SmokeTester | None = None,
+) -> dict:
+    report = run_doctor_report(
+        config=config,
+        github_token=github_token,
+        openai_api_key=openai_api_key,
+        openai_base_url=openai_base_url,
+        api_mode=api_mode,
+        model_profile=model_profile,
+        smoke=smoke,
+        smoke_tester=smoke_tester,
+    )
+    return {
+        "ok": report.ok,
+        "githubTokenConfigured": report.github_token_configured,
+        "openaiApiKeyConfigured": report.openai_api_key_configured,
+        "openaiBaseUrlConfigured": report.openai_base_url_configured,
+        "openaiBaseUrlStatus": report.openai_base_url_status,
+        "apiMode": report.api_mode,
+        "fastModel": report.fast_model,
+        "strongModel": report.strong_model,
+        "smokeOk": report.smoke_ok,
+        "smokeError": report.smoke_error,
+        "warnings": report.warnings,
+        "limitations": report.limitations,
+    }
+
+
+def quality_evaluation_payload(fixture_id: str = "all") -> dict:
+    report = evaluate_builtin_fixtures(fixture_id=fixture_id or "all")
+    return report.model_dump(by_alias=True, mode="json")
+
+
+def quality_snapshot_save_payload(
+    store: QualitySnapshotStore,
+    *,
+    fixture_id: str,
+    label: str | None = None,
+) -> dict:
+    report = evaluate_builtin_fixtures(fixture_id=fixture_id or "all")
+    snapshot = store.save(report, label=label)
+    return snapshot.model_dump(by_alias=True, mode="json")
+
+
+def quality_snapshot_list_payload(store: QualitySnapshotStore) -> dict:
+    return {"snapshots": store.list_summaries()}
+
+
+def quality_snapshot_compare_payload(
+    store: QualitySnapshotStore,
+    *,
+    base_id: str,
+    target_id: str,
+) -> dict:
+    comparison = store.compare(base_id, target_id)
+    return comparison.model_dump(by_alias=True, mode="json")
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _progress_event(
+    stage: str,
+    label: str,
+    status: ProgressStatus,
+    message: str | None = None,
+    *,
+    timestamp: str | None = None,
+) -> ProgressEvent:
+    return ProgressEvent(
+        stage=stage,
+        label=label,
+        status=status,
+        timestamp=timestamp or _now(),
+        message=message,
+    )
+
+
+def _subprocess_executor(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _build_env() -> dict[str, str]:
+    env = os.environ.copy()
+    src_dir = Path(__file__).resolve().parents[1]
+    current = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{current}" if current else str(src_dir)
+    return env
+
+
+class ReviewJobStore:
+    def __init__(
+        self,
+        *,
+        executor: Executor = _subprocess_executor,
+        cwd: Path | None = None,
+        python_executable: str | None = None,
+        max_jobs: int = 30,
+        storage_dir: Path | None = None,
+    ) -> None:
+        self._executor = executor
+        self._cwd = cwd or Path.cwd()
+        self._python_executable = python_executable or sys.executable
+        self._max_jobs = max_jobs
+        self._storage_dir = storage_dir
+        self._jobs: dict[str, ReviewJob] = {}
+        self._order: list[str] = []
+        self._lock = threading.Lock()
+        self._load_from_disk()
+
+    def start(self, request: ReviewRunRequest) -> ReviewJob:
+        created_at = _now()
+        job = ReviewJob(
+            id=uuid.uuid4().hex,
+            status="queued",
+            command=display_command(request),
+            request=request,
+            createdAt=created_at,
+            progress=[
+                _progress_event(
+                    "queued",
+                    "任务已入队",
+                    "completed",
+                    timestamp=created_at,
+                )
+            ],
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+            self._order.append(job.id)
+            self._persist_locked(job)
+        thread = threading.Thread(target=self._run, args=(job.id,), daemon=True)
+        thread.start()
+        return self.get(job.id)
+
+    def get(self, job_id: str) -> ReviewJob:
+        with self._lock:
+            job = self._jobs[job_id]
+            return job.model_copy(deep=True)
+
+    def list_recent(
+        self,
+        *,
+        query: str = "",
+        status: JobStatus | None = None,
+        repository: str = "",
+        created_from: str | None = None,
+        created_to: str | None = None,
+    ) -> list[dict]:
+        with self._lock:
+            jobs = []
+            for job_id in reversed(self._order):
+                job = self._jobs[job_id]
+                if not _matches_history_filters(
+                    job,
+                    query=query,
+                    status=status,
+                    repository=repository,
+                    created_from=created_from,
+                    created_to=created_to,
+                ):
+                    continue
+                jobs.append(job.model_copy(deep=True))
+                if len(jobs) >= self._max_jobs:
+                    break
+        return [_job_summary(job) for job in jobs]
+
+    def delete(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            if job.status in {"queued", "running"}:
+                raise ValueError("运行中的 Review 任务不能删除")
+            del self._jobs[job_id]
+            self._order = [current_id for current_id in self._order if current_id != job_id]
+            self._delete_files_locked(job_id)
+            return True
+
+    def clear_finished(self) -> int:
+        with self._lock:
+            deletable_ids = [
+                job_id
+                for job_id in self._order
+                if self._jobs[job_id].status not in {"queued", "running"}
+            ]
+            for job_id in deletable_ids:
+                del self._jobs[job_id]
+                self._delete_files_locked(job_id)
+            deleted_ids = set(deletable_ids)
+            self._order = [job_id for job_id in self._order if job_id not in deleted_ids]
+            return len(deletable_ids)
+
+    def export(self, job_id: str, output_format: Literal["markdown", "json"]) -> str:
+        job = self.get(job_id)
+        if output_format == "json":
+            return json.dumps(job.model_dump(by_alias=True), ensure_ascii=False, indent=2)
+        output = job.stdout or job.stderr or job.error
+        if output:
+            return output
+        return f"# AI PR Review\n\n任务状态：{job.status}\n"
+
+    def _replace(self, job: ReviewJob) -> None:
+        with self._lock:
+            self._jobs[job.id] = job
+            self._persist_locked(job)
+
+    def _load_from_disk(self) -> None:
+        if self._storage_dir is None or not self._storage_dir.exists():
+            return
+        for path in sorted(self._storage_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                job = ReviewJob.model_validate(payload)
+            except (OSError, ValueError, ValidationError):
+                continue
+            if job.status in {"queued", "running"}:
+                job.status = "failed"
+                job.finished_at = job.finished_at or _now()
+                job.error = job.error or "Web 服务重启前任务未完成"
+                job.progress.append(
+                    _progress_event(
+                        "process_error",
+                        "服务重启前任务中断",
+                        "failed",
+                        job.error,
+                        timestamp=job.finished_at,
+                    )
+                )
+                try:
+                    path.write_text(job.model_dump_json(by_alias=True), encoding="utf-8")
+                except OSError:
+                    pass
+            self._jobs[job.id] = job
+            self._order.append(job.id)
+
+    def _persist_locked(self, job: ReviewJob) -> None:
+        if self._storage_dir is None:
+            return
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
+        target = self._storage_dir / f"{job.id}.json"
+        target.write_text(job.model_dump_json(by_alias=True), encoding="utf-8")
+
+    def _delete_files_locked(self, job_id: str) -> None:
+        if self._storage_dir is None:
+            return
+        for suffix in (".json", ".progress.jsonl"):
+            try:
+                (self._storage_dir / f"{job_id}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _run(self, job_id: str) -> None:
+        job = self.get(job_id)
+        job.status = "running"
+        job.started_at = _now()
+        job.progress.append(
+            _progress_event(
+                "process_start",
+                "启动 Review 进程",
+                "completed",
+                timestamp=job.started_at,
+            )
+        )
+        self._replace(job)
+        command = [self._python_executable, "-m", "ai_pr_review", *build_cli_args(job.request)]
+        env = _build_env()
+        progress_path = self._progress_path(job.id)
+        stop_monitor = threading.Event()
+        monitor_thread: threading.Thread | None = None
+        if progress_path is not None:
+            env[PROGRESS_FILE_ENV] = str(progress_path)
+            monitor_thread = threading.Thread(
+                target=self._monitor_progress_file,
+                args=(job.id, progress_path, stop_monitor),
+                daemon=True,
+            )
+            monitor_thread.start()
+        try:
+            result = self._executor(command, cwd=self._cwd, env=env)
+        except Exception as exc:  # pragma: no cover - defensive process boundary
+            stop_monitor.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=0.5)
+            if progress_path is not None:
+                self._refresh_progress_from_file(job_id, progress_path)
+            job = self.get(job_id)
+            job.status = "failed"
+            job.finished_at = _now()
+            job.error = str(exc)
+            job.progress.append(
+                _progress_event(
+                    "process_error",
+                    "Review 进程异常退出",
+                    "failed",
+                    str(exc),
+                    timestamp=job.finished_at,
+                )
+            )
+            self._replace(job)
+            return
+
+        stop_monitor.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=0.5)
+        if progress_path is not None:
+            self._refresh_progress_from_file(job_id, progress_path)
+
+        job = self.get(job_id)
+        job.status = "succeeded" if result.returncode == 0 else "failed"
+        job.finished_at = _now()
+        job.exit_code = result.returncode
+        job.stdout = result.stdout
+        job.stderr = result.stderr
+        job.progress.append(
+            _progress_event(
+                "process_exit",
+                "Review 进程完成" if result.returncode == 0 else "Review 进程失败",
+                "completed" if result.returncode == 0 else "failed",
+                f"exit {result.returncode}",
+                timestamp=job.finished_at,
+            )
+        )
+        self._replace(job)
+
+    def _progress_path(self, job_id: str) -> Path | None:
+        if self._storage_dir is None:
+            return None
+        return self._storage_dir / f"{job_id}.progress.jsonl"
+
+    def _monitor_progress_file(
+        self,
+        job_id: str,
+        path: Path,
+        stop_event: threading.Event,
+    ) -> None:
+        while not stop_event.wait(0.25):
+            self._refresh_progress_from_file(job_id, path)
+        self._refresh_progress_from_file(job_id, path)
+
+    def _refresh_progress_from_file(self, job_id: str, path: Path) -> None:
+        raw_events = read_progress_events(path)
+        if not raw_events:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            existing = {_progress_key(event) for event in job.progress}
+            changed = False
+            for raw_event in raw_events:
+                try:
+                    event = ProgressEvent.model_validate(raw_event)
+                except ValidationError:
+                    continue
+                key = _progress_key(event)
+                if key in existing:
+                    continue
+                job.progress.append(event)
+                existing.add(key)
+                changed = True
+            if changed:
+                self._persist_locked(job)
+
+
+class BatchReviewStore:
+    def __init__(
+        self,
+        *,
+        review_store: ReviewJobStore,
+        poll_interval: float = 0.25,
+        max_batches: int = 20,
+    ) -> None:
+        self._review_store = review_store
+        self._poll_interval = poll_interval
+        self._max_batches = max_batches
+        self._batches: dict[str, BatchReviewJob] = {}
+        self._order: list[str] = []
+        self._requests: dict[str, list[ReviewRunRequest]] = {}
+        self._lock = threading.Lock()
+
+    def start(self, request: BatchReviewRunRequest) -> BatchReviewJob:
+        created_at = _now()
+        batch_id = uuid.uuid4().hex
+        items = [
+            BatchReviewItem(
+                id=uuid.uuid4().hex,
+                prUrl=review_request.pr_url,
+                number=_pull_number(review_request.pr_url),
+            )
+            for review_request in request.requests
+        ]
+        batch = BatchReviewJob(
+            id=batch_id,
+            status="queued",
+            createdAt=created_at,
+            total=len(items),
+            items=items,
+        )
+        with self._lock:
+            self._batches[batch.id] = batch
+            self._requests[batch.id] = list(request.requests)
+            self._order.append(batch.id)
+            self._trim_locked()
+        thread = threading.Thread(target=self._run, args=(batch.id,), daemon=True)
+        thread.start()
+        return self.get(batch.id)
+
+    def get(self, batch_id: str) -> BatchReviewJob:
+        with self._lock:
+            return self._batches[batch_id].model_copy(deep=True)
+
+    def list_recent(self) -> list[dict]:
+        with self._lock:
+            batches = [self._batches[batch_id].model_copy(deep=True) for batch_id in reversed(self._order)]
+        return [_batch_payload(batch) for batch in batches]
+
+    def _run(self, batch_id: str) -> None:
+        with self._lock:
+            batch = self._batches[batch_id]
+            batch.status = "running"
+            batch.started_at = _now()
+            requests = list(self._requests[batch_id])
+
+        for index, request in enumerate(requests):
+            batch = self.get(batch_id)
+            if batch.status not in {"queued", "running"}:
+                return
+            item = batch.items[index]
+            self._update_item(batch_id, index, item.model_copy(update={"status": "running"}))
+            safe_request = _batch_safe_request(request)
+            job = self._review_store.start(safe_request)
+            self._update_item(batch_id, index, item.model_copy(update={"status": "running", "job_id": job.id}))
+
+            while True:
+                current = self._review_store.get(job.id)
+                if current.status not in {"queued", "running"}:
+                    break
+                time.sleep(self._poll_interval)
+
+            self._update_item(batch_id, index, _item_from_review_job(item, current))
+
+        with self._lock:
+            batch = self._batches[batch_id]
+            failed = sum(1 for item in batch.items if item.status == "failed")
+            completed = sum(1 for item in batch.items if item.status in {"succeeded", "failed", "skipped"})
+            batch.failed = failed
+            batch.completed = completed
+            batch.status = "failed" if failed else "succeeded"
+            batch.finished_at = _now()
+
+    def _update_item(self, batch_id: str, index: int, item: BatchReviewItem) -> None:
+        with self._lock:
+            batch = self._batches[batch_id]
+            items = list(batch.items)
+            items[index] = item
+            completed = sum(1 for current in items if current.status in {"succeeded", "failed", "skipped"})
+            failed = sum(1 for current in items if current.status == "failed")
+            self._batches[batch_id] = batch.model_copy(
+                update={
+                    "items": items,
+                    "completed": completed,
+                    "failed": failed,
+                }
+            )
+
+    def _trim_locked(self) -> None:
+        while len(self._order) > self._max_batches:
+            batch_id = self._order.pop(0)
+            self._batches.pop(batch_id, None)
+            self._requests.pop(batch_id, None)
+
+
+class WatcherStore:
+    def __init__(
+        self,
+        *,
+        review_starter: ReviewStarter,
+        github_factory: GitHubFactory,
+        max_watchers: int = 20,
+        storage_dir: Path | None = None,
+    ) -> None:
+        self._review_starter = review_starter
+        self._github_factory = github_factory
+        self._max_watchers = max_watchers
+        self._storage_dir = storage_dir
+        self._watchers: dict[str, WatcherJob] = {}
+        self._order: list[str] = []
+        self._threads: dict[str, threading.Thread] = {}
+        self._lock = threading.Lock()
+        self._load_from_disk()
+
+    def create(self, request: WatcherRunRequest) -> WatcherJob:
+        watcher = WatcherJob(
+            id=uuid.uuid4().hex,
+            request=request,
+            createdAt=_now(),
+        )
+        with self._lock:
+            self._watchers[watcher.id] = watcher
+            self._order.append(watcher.id)
+            self._trim_locked()
+            self._persist_locked(watcher)
+        return self.get(watcher.id)
+
+    def get(self, watcher_id: str) -> WatcherJob:
+        with self._lock:
+            return self._watchers[watcher_id].model_copy(deep=True)
+
+    def list_recent(self) -> list[dict]:
+        with self._lock:
+            watchers = [
+                self._watchers[watcher_id].model_copy(deep=True)
+                for watcher_id in reversed(self._order)
+            ]
+        return [_watcher_payload(watcher) for watcher in watchers]
+
+    def start(self, watcher_id: str) -> WatcherJob:
+        with self._lock:
+            watcher = self._watchers[watcher_id]
+            watcher.status = "running"
+            watcher.started_at = watcher.started_at or _now()
+            watcher.last_error = None
+            self._persist_locked(watcher)
+            thread = self._threads.get(watcher_id)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(target=self._run_loop, args=(watcher_id,), daemon=True)
+                self._threads[watcher_id] = thread
+                thread.start()
+            return watcher.model_copy(deep=True)
+
+    def pause(self, watcher_id: str) -> WatcherJob:
+        with self._lock:
+            watcher = self._watchers[watcher_id]
+            watcher.status = "paused"
+            self._persist_locked(watcher)
+            return watcher.model_copy(deep=True)
+
+    def delete(self, watcher_id: str) -> bool:
+        with self._lock:
+            if watcher_id not in self._watchers:
+                return False
+            self._watchers[watcher_id].status = "paused"
+            del self._watchers[watcher_id]
+            self._order = [current for current in self._order if current != watcher_id]
+            self._threads.pop(watcher_id, None)
+            self._delete_file_locked(watcher_id)
+            return True
+
+    def check_once(self, watcher_id: str) -> WatcherJob:
+        watcher = self.get(watcher_id)
+        triggered_reviews: list[WatcherTriggeredReview] = []
+        try:
+            with self._github_factory() as github:
+                pulls = github.list_repository_pulls(  # type: ignore[attr-defined]
+                    watcher.request.owner,
+                    watcher.request.repo,
+                    state=watcher.request.state,
+                )
+            for pull in pulls:
+                if bool(pull.get("draft")) and not watcher.request.include_drafts:
+                    continue
+                pr_number = int(pull.get("number") or 0)
+                if pr_number <= 0:
+                    continue
+                head_sha = _pull_head_sha(pull)
+                if not head_sha or watcher.seen_heads.get(pr_number) == head_sha:
+                    continue
+                review_request = _watcher_review_request(watcher.request, pull, pr_number)
+                review_job = self._review_starter(review_request)
+                triggered_reviews.append(
+                    WatcherTriggeredReview(
+                        prNumber=pr_number,
+                        prUrl=review_request.pr_url,
+                        title=str(pull.get("title") or ""),
+                        headSha=head_sha,
+                        jobId=str(getattr(review_job, "id", "") or "") or None,
+                        triggeredAt=_now(),
+                    )
+                )
+                watcher.seen_heads[pr_number] = head_sha
+        except Exception as exc:
+            return self._replace_watcher(
+                watcher.model_copy(
+                    update={
+                        "status": "failed",
+                        "last_checked_at": _now(),
+                        "last_error": str(exc),
+                        "triggered": 0,
+                    }
+                )
+            )
+
+        return self._replace_watcher(
+            watcher.model_copy(
+                update={
+                    "last_checked_at": _now(),
+                    "last_error": None,
+                    "triggered": len(triggered_reviews),
+                    "recent_reviews": [*triggered_reviews, *watcher.recent_reviews][:50],
+                }
+            )
+        )
+
+    def _replace_watcher(self, watcher: WatcherJob) -> WatcherJob:
+        with self._lock:
+            current = self._watchers.get(watcher.id)
+            if current is not None and current.status == "running" and watcher.status == "paused":
+                watcher = watcher.model_copy(update={"status": "running"})
+            self._watchers[watcher.id] = watcher
+            self._persist_locked(watcher)
+            return watcher.model_copy(deep=True)
+
+    def _run_loop(self, watcher_id: str) -> None:
+        while True:
+            try:
+                watcher = self.get(watcher_id)
+            except KeyError:
+                return
+            if watcher.status != "running":
+                return
+            checked = self.check_once(watcher_id)
+            if checked.status != "running":
+                return
+            _sleep_interruptibly(
+                checked.request.interval_seconds,
+                lambda: self._is_running(watcher_id),
+            )
+
+    def _is_running(self, watcher_id: str) -> bool:
+        with self._lock:
+            watcher = self._watchers.get(watcher_id)
+            return watcher is not None and watcher.status == "running"
+
+    def _trim_locked(self) -> None:
+        while len(self._order) > self._max_watchers:
+            watcher_id = self._order.pop(0)
+            self._watchers.pop(watcher_id, None)
+            self._threads.pop(watcher_id, None)
+            self._delete_file_locked(watcher_id)
+
+    def _load_from_disk(self) -> None:
+        if self._storage_dir is None or not self._storage_dir.exists():
+            return
+        loaded: list[WatcherJob] = []
+        for path in sorted(self._storage_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                watcher = WatcherJob.model_validate(payload)
+            except (OSError, ValueError, ValidationError):
+                continue
+            if watcher.status == "running":
+                watcher = watcher.model_copy(update={"status": "paused"})
+                try:
+                    path.write_text(watcher.model_dump_json(by_alias=True), encoding="utf-8")
+                except OSError:
+                    pass
+            loaded.append(watcher)
+        loaded.sort(key=lambda watcher: watcher.created_at)
+        with self._lock:
+            for watcher in loaded[-self._max_watchers :]:
+                self._watchers[watcher.id] = watcher
+                self._order.append(watcher.id)
+
+    def _persist_locked(self, watcher: WatcherJob) -> None:
+        if self._storage_dir is None:
+            return
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
+        target = self._storage_dir / f"{watcher.id}.json"
+        target.write_text(watcher.model_dump_json(by_alias=True), encoding="utf-8")
+
+    def _delete_file_locked(self, watcher_id: str) -> None:
+        if self._storage_dir is None:
+            return
+        try:
+            (self._storage_dir / f"{watcher_id}.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def create_handler(
+    *,
+    store: ReviewJobStore,
+    batch_store: BatchReviewStore,
+    watcher_store: WatcherStore,
+    quality_store: QualitySnapshotStore,
+    frontend_dir: Path,
+) -> type[BaseHTTPRequestHandler]:
+    static_root = frontend_dir.resolve()
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "AIPrReviewWeb/0.1"
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_cors_headers()
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/api/health":
+                self._send_json({"ok": True})
+                return
+            if path == "/api/doctor":
+                self._handle_doctor()
+                return
+            if path == "/api/quality-evaluation":
+                self._handle_quality_evaluation()
+                return
+            if path == "/api/quality-evaluation/snapshots":
+                self._send_json(quality_snapshot_list_payload(quality_store))
+                return
+            if path == "/api/quality-evaluation/snapshots/compare":
+                self._handle_quality_snapshot_compare()
+                return
+            if path == "/api/reviews":
+                self._handle_review_list()
+                return
+            if path == "/api/batches":
+                self._send_json({"batches": batch_store.list_recent()})
+                return
+            if path == "/api/watchers":
+                self._send_json({"watchers": watcher_store.list_recent()})
+                return
+            if path.startswith("/api/watchers/"):
+                watcher_id = path.rsplit("/", 1)[-1]
+                try:
+                    watcher = watcher_store.get(watcher_id)
+                except KeyError:
+                    self._send_json({"error": "watcher not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(_watcher_payload(watcher))
+                return
+            if path.startswith("/api/batches/"):
+                batch_id = path.rsplit("/", 1)[-1]
+                try:
+                    batch = batch_store.get(batch_id)
+                except KeyError:
+                    self._send_json({"error": "batch job not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(_batch_payload(batch))
+                return
+            if path.startswith("/api/reviews/") and path.endswith("/export"):
+                self._handle_review_export(path)
+                return
+            if path.startswith("/api/reviews/") and path.endswith("/diff"):
+                self._handle_review_diff(path)
+                return
+            if path.startswith("/api/reviews/") and path.endswith("/inline-preview"):
+                job_id = path.split("/")[-2]
+                try:
+                    job = store.get(job_id)
+                except KeyError:
+                    self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(_inline_preview_for_job(job))
+                return
+            if path == "/api/github/repos":
+                self._handle_github_repos()
+                return
+            if path.startswith("/api/github/repos/") and path.endswith("/pulls"):
+                self._handle_github_pulls(path)
+                return
+            if path.startswith("/api/reviews/"):
+                job_id = path.rsplit("/", 1)[-1]
+                try:
+                    job = store.get(job_id)
+                except KeyError:
+                    self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(_job_payload(job))
+                return
+            if path.startswith("/api/"):
+                self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._serve_static(path)
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/api/quality-evaluation/snapshots":
+                self._handle_quality_snapshot_save()
+                return
+            if path == "/api/batches":
+                self._handle_batch_start()
+                return
+            if path == "/api/watchers":
+                self._handle_watcher_create()
+                return
+            if path.startswith("/api/watchers/"):
+                self._handle_watcher_action(path)
+                return
+            if path != "/api/reviews":
+                self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+
+            try:
+                payload = self._read_json()
+                request = ReviewRunRequest.model_validate(payload)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except ValidationError as exc:
+                self._send_json({"error": "invalid review request", "details": exc.errors()}, status=422)
+                return
+
+            job = store.start(request)
+            self._send_json(_job_payload(job), status=HTTPStatus.ACCEPTED)
+
+        def _handle_batch_start(self) -> None:
+            try:
+                payload = self._read_json()
+                request = BatchReviewRunRequest.model_validate(payload)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except ValidationError as exc:
+                self._send_json({"error": "invalid batch request", "details": exc.errors()}, status=422)
+                return
+            batch = batch_store.start(request)
+            self._send_json(_batch_payload(batch), status=HTTPStatus.ACCEPTED)
+
+        def _handle_watcher_create(self) -> None:
+            try:
+                payload = self._read_json()
+                request = WatcherRunRequest.model_validate(payload)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except ValidationError as exc:
+                self._send_json({"error": "invalid watcher request", "details": exc.errors()}, status=422)
+                return
+            watcher = watcher_store.create(request)
+            watcher = watcher_store.start(watcher.id)
+            self._send_json(_watcher_payload(watcher), status=HTTPStatus.ACCEPTED)
+
+        def _handle_watcher_action(self, path: str) -> None:
+            parts = [part for part in path.split("/") if part]
+            if len(parts) != 4 or parts[0] != "api" or parts[1] != "watchers":
+                self._send_json({"error": "invalid watcher path"}, status=HTTPStatus.NOT_FOUND)
+                return
+            watcher_id = parts[2]
+            action = parts[3]
+            try:
+                if action == "start":
+                    self._send_json(_watcher_payload(watcher_store.start(watcher_id)))
+                    return
+                if action == "pause":
+                    self._send_json(_watcher_payload(watcher_store.pause(watcher_id)))
+                    return
+                if action == "check":
+                    self._send_json(_watcher_payload(watcher_store.check_once(watcher_id)))
+                    return
+            except KeyError:
+                self._send_json({"error": "watcher not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({"error": "unknown watcher action"}, status=HTTPStatus.NOT_FOUND)
+
+        def do_DELETE(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/api/reviews":
+                deleted = store.clear_finished()
+                self._send_json({"deleted": deleted})
+                return
+            if path.startswith("/api/reviews/"):
+                job_id = path.rsplit("/", 1)[-1]
+                try:
+                    deleted = store.delete(job_id)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                    return
+                if not deleted:
+                    self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"deleted": 1})
+                return
+            if path.startswith("/api/watchers/"):
+                watcher_id = path.rsplit("/", 1)[-1]
+                deleted = watcher_store.delete(watcher_id)
+                if not deleted:
+                    self._send_json({"error": "watcher not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"deleted": 1})
+                return
+            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def _handle_review_list(self) -> None:
+            params = parse_qs(urlparse(self.path).query)
+            status = (params.get("status") or [""])[0].strip() or None
+            if status is not None and status not in {"queued", "running", "succeeded", "failed"}:
+                self._send_json(
+                    {"error": "status 只能是 queued、running、succeeded 或 failed"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                jobs = store.list_recent(
+                    query=(params.get("query") or [""])[0],
+                    status=status,
+                    repository=(params.get("repo") or [""])[0],
+                    created_from=(params.get("from") or [None])[0],
+                    created_to=(params.get("to") or [None])[0],
+                )
+            except ValueError:
+                self._send_json(
+                    {"error": "日期格式必须是 YYYY-MM-DD"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self._send_json({"jobs": jobs})
+
+        def _handle_review_export(self, path: str) -> None:
+            job_id = path.split("/")[-2]
+            params = parse_qs(urlparse(self.path).query)
+            output_format = (params.get("format") or ["markdown"])[0].strip() or "markdown"
+            if output_format not in {"markdown", "json"}:
+                self._send_json(
+                    {"error": "format 只能是 markdown 或 json"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            export_format: Literal["markdown", "json"] = (
+                "json" if output_format == "json" else "markdown"
+            )
+            try:
+                content = store.export(job_id, export_format)
+            except KeyError:
+                self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            content_type = (
+                "application/json; charset=utf-8"
+                if output_format == "json"
+                else "text/markdown; charset=utf-8"
+            )
+            extension = "json" if output_format == "json" else "md"
+            self._send_text(
+                content,
+                content_type=content_type,
+                filename=f"ai-pr-review-{job_id}.{extension}",
+            )
+
+        def _handle_review_diff(self, path: str) -> None:
+            job_id = path.split("/")[-2]
+            try:
+                job = store.get(job_id)
+                ref = parse_pr_url(job.request.pr_url)
+            except KeyError:
+                self._send_json({"error": "review job not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            except PRUrlError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                with _github_client() as github:
+                    raw_diff = github.get_pr_diff(ref)
+            except GitHubAPIError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+                return
+            self._send_json(diff_preview_payload(raw_diff, job.stdout))
+
+        def _handle_doctor(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            smoke = (query.get("smoke") or ["false"])[0].lower() == "true"
+            model_profile = (query.get("model") or ["balanced"])[0]
+            if model_profile not in {"fast", "balanced", "accurate"}:
+                self._send_json(
+                    {"error": "model 只能是 fast、balanced 或 accurate"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                config = load_config()
+                payload = doctor_payload(
+                    config=config,
+                    github_token=resolve_github_token(config),
+                    openai_api_key=resolve_openai_api_key(config),
+                    openai_base_url=resolve_openai_base_url(config),
+                    api_mode=resolve_openai_api_mode(config),
+                    model_profile=model_profile,
+                    smoke=smoke,
+                )
+            except (ValueError, RuntimeError) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(payload)
+
+        def _handle_quality_evaluation(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            fixture_id = (query.get("fixture") or ["all"])[0].strip() or "all"
+            try:
+                self._send_json(quality_evaluation_payload(fixture_id))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+        def _handle_quality_snapshot_save(self) -> None:
+            try:
+                payload = self._read_json()
+                fixture_id = str(payload.get("fixture") or "all")
+                label = payload.get("label")
+                if label is not None:
+                    label = str(label)
+                self._send_json(
+                    quality_snapshot_save_payload(
+                        quality_store,
+                        fixture_id=fixture_id,
+                        label=label,
+                    ),
+                    status=HTTPStatus.CREATED,
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+        def _handle_quality_snapshot_compare(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            base_id = (query.get("base") or [""])[0].strip()
+            target_id = (query.get("target") or [""])[0].strip()
+            if not base_id or not target_id:
+                self._send_json(
+                    {"error": "base 和 target 快照不能为空"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                self._send_json(
+                    quality_snapshot_compare_payload(
+                        quality_store,
+                        base_id=base_id,
+                        target_id=target_id,
+                    )
+                )
+            except KeyError:
+                self._send_json({"error": "quality snapshot not found"}, status=HTTPStatus.NOT_FOUND)
+
+        def _handle_github_repos(self) -> None:
+            query = parse_qs(urlparse(self.path).query)
+            owner = (query.get("owner") or [""])[0].strip()
+            if not _valid_owner_or_repo(owner):
+                self._send_json(
+                    {"error": "请输入有效的 GitHub 用户名或组织名"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                with _github_client() as github:
+                    self._send_json(github_repos_payload(owner, github))
+            except GitHubAPIError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+
+        def _handle_github_pulls(self, path: str) -> None:
+            parts = [part for part in path.split("/") if part]
+            if len(parts) != 6:
+                self._send_json({"error": "invalid pulls path"}, status=HTTPStatus.NOT_FOUND)
+                return
+            owner = unquote(parts[3]).strip()
+            repo = unquote(parts[4]).strip()
+            query = parse_qs(urlparse(self.path).query)
+            state = (query.get("state") or ["open"])[0].strip() or "open"
+            if not _valid_owner_or_repo(owner) or not _valid_owner_or_repo(repo):
+                self._send_json(
+                    {"error": "请输入有效的 owner 和 repo"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if state not in {"open", "closed", "all"}:
+                self._send_json(
+                    {"error": "state 只能是 open、closed 或 all"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                with _github_client() as github:
+                    self._send_json(github_pulls_payload(owner, repo, state, github))
+            except GitHubAPIError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+
+        def _read_json(self) -> dict:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length > 1024 * 1024:
+                raise ValueError("request body is too large")
+            body = self.rfile.read(length)
+            if not body:
+                return {}
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise ValueError("request body must be valid JSON") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
+
+        def _serve_static(self, path: str) -> None:
+            if not static_root.exists():
+                self._send_json(
+                    {
+                        "error": "frontend build not found",
+                        "hint": "run: cd frontend && npm install && npm run build",
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+
+            rel_path = unquote(path.lstrip("/")) or "index.html"
+            target = (static_root / rel_path).resolve()
+            if not _is_relative_to(target, static_root):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            if not target.exists() or target.is_dir():
+                target = static_root / "index.html"
+            if not target.exists():
+                self._send_json(
+                    {"error": "frontend index.html not found"},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+
+            content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+            data = target.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self._send_cors_headers()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_text(
+            self,
+            content: str,
+            *,
+            content_type: str,
+            filename: str | None = None,
+            status: int = HTTPStatus.OK,
+        ) -> None:
+            data = content.encode("utf-8")
+            self.send_response(status)
+            self._send_cors_headers()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            if filename:
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_cors_headers(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+
+    return Handler
+
+
+def run_web_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    frontend_dir: str | Path | None = None,
+) -> int:
+    root = Path(__file__).resolve().parents[2]
+    static_dir = Path(frontend_dir) if frontend_dir else root / "frontend" / "dist"
+    store = ReviewJobStore(cwd=root, storage_dir=root / ".ai-pr-review" / "runs")
+    batch_store = BatchReviewStore(review_store=store)
+    watcher_store = WatcherStore(
+        review_starter=store.start,
+        github_factory=_github_client,
+        storage_dir=root / ".ai-pr-review" / "watchers",
+    )
+    quality_store = QualitySnapshotStore(root / ".ai-pr-review" / "quality-eval")
+    handler = create_handler(
+        store=store,
+        batch_store=batch_store,
+        watcher_store=watcher_store,
+        quality_store=quality_store,
+        frontend_dir=static_dir,
+    )
+    server = ThreadingHTTPServer((host, port), handler)
+    print(f"AI PR Review Web 正在运行：http://{host}:{port}")
+    print("按 Ctrl+C 停止。")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止 AI PR Review Web。")
+    finally:
+        server.server_close()
+    return 0
+
+
+def _job_payload(job: ReviewJob) -> dict:
+    return job.model_dump(by_alias=True)
+
+
+def _batch_payload(batch: BatchReviewJob) -> dict:
+    return batch.model_dump(by_alias=True)
+
+
+def _watcher_payload(watcher: WatcherJob) -> dict:
+    return watcher.model_dump(by_alias=True)
+
+
+def _batch_safe_request(request: ReviewRunRequest) -> ReviewRunRequest:
+    return request.model_copy(
+        update={
+            "output_format": "json",
+            "post_comment": False,
+            "post_inline_comments": False,
+        }
+    )
+
+
+def _item_from_review_job(item: BatchReviewItem, job: ReviewJob) -> BatchReviewItem:
+    if job.status != "succeeded":
+        error = job.stderr.strip() or job.error or f"exit {job.exit_code}"
+        return item.model_copy(
+            update={
+                "job_id": job.id,
+                "status": "failed",
+                "error": error,
+            }
+        )
+    summary = _review_output_summary(job.stdout)
+    return item.model_copy(
+        update={
+            "job_id": job.id,
+            "status": "succeeded",
+            "risk": summary["risk"],
+            "merge_recommendation": summary["mergeRecommendation"],
+            "blocking_findings": summary["blockingFindings"],
+            "coverage_ratio": summary["coverageRatio"],
+            "error": None,
+        }
+    )
+
+
+def _review_output_summary(output: str) -> dict:
+    try:
+        payload = json.loads(output)
+    except ValueError:
+        return {
+            "risk": "unknown",
+            "mergeRecommendation": None,
+            "blockingFindings": 0,
+            "coverageRatio": None,
+        }
+    if not isinstance(payload, dict):
+        return {
+            "risk": "unknown",
+            "mergeRecommendation": None,
+            "blockingFindings": 0,
+            "coverageRatio": None,
+        }
+    risk_overview = payload.get("riskOverview") if isinstance(payload.get("riskOverview"), dict) else {}
+    coverage = payload.get("analysisCoverage") if isinstance(payload.get("analysisCoverage"), dict) else {}
+    return {
+        "risk": _risk_level(risk_overview),
+        "mergeRecommendation": payload.get("mergeRecommendation"),
+        "blockingFindings": int(risk_overview.get("blocking") or 0),
+        "coverageRatio": coverage.get("coverageRatio"),
+    }
+
+
+def _risk_level(risk_overview: dict) -> RiskLevel:
+    for level in ("critical", "high", "medium", "low"):
+        if int(risk_overview.get(level) or 0) > 0:
+            return level
+    return "low"
+
+
+def _pull_number(pr_url: str) -> int | None:
+    try:
+        return parse_pr_url(pr_url).number
+    except PRUrlError:
+        return None
+
+
+def _pull_head_sha(pull: dict) -> str:
+    head = pull.get("head")
+    if isinstance(head, dict):
+        sha = head.get("sha")
+        if isinstance(sha, str):
+            return sha
+    return str(pull.get("updated_at") or "")
+
+
+def _watcher_review_request(
+    watcher_request: WatcherRunRequest,
+    pull: dict,
+    pr_number: int,
+) -> ReviewRunRequest:
+    pr_url = str(
+        pull.get("html_url")
+        or f"https://github.com/{watcher_request.owner}/{watcher_request.repo}/pull/{pr_number}"
+    )
+    return ReviewRunRequest(
+        prUrl=pr_url,
+        format="json",
+        postComment=False,
+        postInlineComments=False,
+        model=watcher_request.model_profile,
+        changedOnly=watcher_request.changed_only,
+        withContext=watcher_request.with_context,
+        noLlm=watcher_request.no_llm,
+        llmMaxChunks=watcher_request.llm_max_chunks,
+        maxFiles=watcher_request.max_files,
+        maxChunks=watcher_request.max_chunks,
+        maxContextFiles=watcher_request.max_context_files,
+        maxPatchLinesPerChunk=watcher_request.max_patch_lines_per_chunk,
+        debugChunks=True,
+    )
+
+
+def _sleep_interruptibly(seconds: int, keep_running: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not keep_running():
+            return
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
+def _progress_key(event: ProgressEvent) -> tuple[str, str, str, str, str | None]:
+    return (event.stage, event.status, event.timestamp, event.label, event.message)
+
+
+def _job_summary(job: ReviewJob) -> dict:
+    output = job.stdout or job.stderr or job.error or ""
+    return {
+        "id": job.id,
+        "status": job.status,
+        "command": job.command,
+        "request": job.request.model_dump(by_alias=True),
+        "createdAt": job.created_at,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+        "exitCode": job.exit_code,
+        "outputPreview": output[:180],
+        "progress": [event.model_dump(exclude_none=True) for event in job.progress],
+    }
+
+
+def _matches_history_filters(
+    job: ReviewJob,
+    *,
+    query: str,
+    status: JobStatus | None,
+    repository: str,
+    created_from: str | None,
+    created_to: str | None,
+) -> bool:
+    if status and job.status != status:
+        return False
+
+    repository_filter = repository.strip().lower()
+    repository_slug = _job_repository(job)
+    if repository_filter and repository_filter not in repository_slug.lower():
+        return False
+
+    created_date = _job_created_date(job)
+    from_date = _parse_history_date(created_from)
+    to_date = _parse_history_date(created_to)
+    if from_date and (created_date is None or created_date < from_date):
+        return False
+    if to_date and (created_date is None or created_date > to_date):
+        return False
+
+    keyword = query.strip().lower()
+    if not keyword:
+        return True
+    haystack = "\n".join(
+        [
+            job.id,
+            job.status,
+            job.command,
+            job.request.pr_url,
+            repository_slug,
+            job.stdout,
+            job.stderr,
+            job.error or "",
+        ]
+    ).lower()
+    return keyword in haystack
+
+
+def _job_repository(job: ReviewJob) -> str:
+    try:
+        ref = parse_pr_url(job.request.pr_url)
+    except PRUrlError:
+        return ""
+    return f"{ref.owner}/{ref.repo}"
+
+
+def _job_created_date(job: ReviewJob) -> date | None:
+    try:
+        return datetime.fromisoformat(job.created_at.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _parse_history_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value)
+
+
+def _inline_preview_for_job(job: ReviewJob) -> dict:
+    ref = parse_pr_url(job.request.pr_url)
+    with _github_client() as github:
+        raw_diff = github.get_pr_diff(ref)
+    return inline_preview_payload(job.stdout, raw_diff)
+
+
+class _GitHubClientContext:
+    def __init__(self) -> None:
+        config = load_config()
+        self._client = GitHubClient(token=resolve_github_token(config))
+
+    def __enter__(self) -> GitHubClient:
+        return self._client
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._client.close()
+
+
+def _github_client() -> _GitHubClientContext:
+    return _GitHubClientContext()
+
+
+def _valid_owner_or_repo(value: str) -> bool:
+    return bool(value) and bool(re.match(OWNER_REPO_PATTERN, value))
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True

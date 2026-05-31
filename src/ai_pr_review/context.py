@@ -49,6 +49,7 @@ def retrieve_context(
     chunks: list[DiffChunk],
     *,
     enabled: bool,
+    max_files: int | None = None,
 ) -> RetrievedContext:
     context = RetrievedContext()
     if not enabled:
@@ -62,6 +63,9 @@ def retrieve_context(
 
     paths = _candidate_paths(chunks)
     for path in paths:
+        if max_files is not None and max_files >= 0 and len(context.files) >= max_files:
+            context.limitations.append(f"上下文文件预算已限制为 {max_files} 个文件")
+            break
         text = github.get_file_text(ref, path, git_ref)
         if text is None:
             continue
