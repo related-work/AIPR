@@ -5,7 +5,8 @@ defineProps({
   activeView: { type: String, required: true },
   navItems: { type: Array, required: true },
   selectedPrLabel: { type: String, required: true },
-  isRunning: { type: Boolean, default: false }
+  isRunning: { type: Boolean, default: false },
+  showPrContext: { type: Boolean, default: false }
 });
 
 const emit = defineEmits(["navigate", "open-command"]);
@@ -39,7 +40,7 @@ const emit = defineEmits(["navigate", "open-command"]);
     </aside>
 
     <main class="main-pane">
-      <header class="main-header">
+      <header v-if="showPrContext" class="main-header">
         <div>
           <p class="header-label">当前 PR</p>
           <h2>{{ selectedPrLabel }}</h2>

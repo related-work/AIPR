@@ -156,7 +156,10 @@ def _smoke_test_llm(
     except Exception as exc:
         return False, f"LLM smoke test 调用失败: {exc}", []
     if result.payload.get("summary") != "ok":
-        return False, "LLM smoke test 返回 JSON 但内容不符合预期", result.limitations
+        return True, None, [
+            *result.limitations,
+            "LLM smoke test 已连通并返回可解析 JSON，但内容不完全符合预期",
+        ]
     return True, None, result.limitations
 
 

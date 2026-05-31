@@ -12,6 +12,7 @@ import RepoBrowser from "./components/RepoBrowser.vue";
 import ReportViewer from "./components/ReportViewer.vue";
 import ReviewRunner from "./components/ReviewRunner.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import WatcherPanel from "./components/WatcherPanel.vue";
 
 const activeView = ref("browse");
 
@@ -54,7 +55,13 @@ const runError = ref("");
 const batchJob = ref(null);
 const batchError = ref("");
 const batchPollingTimer = ref(null);
+const reportCollection = ref({ title: "", jobs: [] });
 const selectedBatchPullUrls = ref([]);
+const watchers = ref([]);
+const watcherError = ref("");
+const loadingWatchers = ref(false);
+const creatingWatcher = ref(false);
+const watcherPollingTimer = ref(null);
 const historyJobs = ref([]);
 const historyError = ref("");
 const loadingHistory = ref(false);
@@ -72,6 +79,19 @@ const qualityCompareBase = ref("");
 const qualityCompareTarget = ref("");
 const qualityComparison = ref(null);
 const qualityComparisonError = ref("");
+const watcherForm = reactive({
+  intervalSeconds: 300,
+  includeDrafts: false,
+  model: "fast",
+  changedOnly: true,
+  withContext: false,
+  noLlm: false,
+  llmMaxChunks: 2,
+  maxFiles: 80,
+  maxChunks: 40,
+  maxContextFiles: 20,
+  maxPatchLinesPerChunk: 400
+});
 const historyFilters = reactive({
   query: "",
   status: "",
@@ -84,6 +104,7 @@ const navItems = [
   { id: "browse", label: "PR 浏览", icon: SearchCode },
   { id: "review", label: "Review 运行", icon: Play },
   { id: "batch", label: "批量 Review", icon: ListChecks },
+  { id: "watch", label: "PR 监控", icon: Activity },
   { id: "report", label: "报告结果", icon: FileText },
   { id: "history", label: "历史记录", icon: History },
   { id: "quality", label: "质量评测", icon: Activity },
@@ -193,10 +214,12 @@ const optionDocs = [
 
 const isRunning = computed(() => ["queued", "running"].includes(job.value?.status));
 const isBatchRunning = computed(() => ["queued", "running"].includes(batchJob.value?.status));
+const isWatcherRunning = computed(() => watchers.value.some((watcher) => watcher.status === "running"));
 const isBrowsing = computed(() => loadingRepos.value || loadingPulls.value);
 const selectedRepo = computed(() => repos.value.find((repo) => repo.name === explorer.repo));
 const selectedPull = computed(() => pulls.value.find((pull) => pull.url === explorer.pullUrl));
 const selectedBatchPulls = computed(() => pulls.value.filter((pull) => selectedBatchPullUrls.value.includes(pull.url)));
+const showPrContext = computed(() => ["review", "report"].includes(activeView.value));
 const selectedPrLabel = computed(() => {
   if (selectedPull.value) {
     return `#${selectedPull.value.number} ${selectedPull.value.title}`;
@@ -344,6 +367,10 @@ function proceedToReview() {
   activeView.value = "review";
 }
 
+function proceedToBatch() {
+  activeView.value = "batch";
+}
+
 function requestPayload() {
   return {
     prUrl: form.prUrl.trim(),
@@ -387,6 +414,7 @@ async function runReview() {
     return;
   }
   runError.value = "";
+  reportCollection.value = { title: "", jobs: [] };
   job.value = null;
   activeView.value = "report";
   try {
@@ -431,6 +459,7 @@ async function runBatchReview() {
     return;
   }
   batchError.value = "";
+  reportCollection.value = { title: "", jobs: [] };
   batchJob.value = null;
   const requests = selectedBatchPulls.value.map((pull) => ({
     ...requestPayload(),
@@ -481,18 +510,166 @@ async function openBatchReport(item) {
   if (!item.jobId) {
     return;
   }
+  await openBatchReports(item.jobId);
+}
+
+async function openBatchReports(selectedJobId = null) {
+  const items = (batchJob.value?.items || []).filter((item) => item.jobId);
+  if (!items.length) {
+    batchError.value = "当前批量任务还没有可打开的报告";
+    return;
+  }
   batchError.value = "";
+  runError.value = "";
   try {
-    const response = await fetch(`/api/reviews/${item.jobId}`);
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "读取批量报告失败");
-    }
-    job.value = payload;
+    const jobs = await Promise.all(items.map(async (item) => {
+      const response = await fetch(`/api/reviews/${item.jobId}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "读取批量报告失败");
+      }
+      return { ...payload, batchItem: item };
+    }));
+    reportCollection.value = {
+      title: `批量报告 · ${jobs.length} 个 PR`,
+      jobs
+    };
+    job.value = jobs.find((item) => item.id === selectedJobId) || jobs[0];
     activeView.value = "report";
   } catch (error) {
     batchError.value = error.message;
   }
+}
+
+function selectReportFromCollection(jobId) {
+  const selected = reportCollection.value.jobs.find((item) => item.id === jobId);
+  if (selected) {
+    job.value = selected;
+  }
+}
+
+function watcherPayload() {
+  return {
+    owner: explorer.owner.trim(),
+    repo: explorer.repo.trim(),
+    intervalSeconds: watcherForm.intervalSeconds,
+    includeDrafts: watcherForm.includeDrafts,
+    model: watcherForm.model,
+    changedOnly: watcherForm.changedOnly,
+    withContext: watcherForm.withContext,
+    noLlm: watcherForm.noLlm,
+    llmMaxChunks: watcherForm.llmMaxChunks,
+    maxFiles: watcherForm.maxFiles,
+    maxChunks: watcherForm.maxChunks,
+    maxContextFiles: watcherForm.maxContextFiles,
+    maxPatchLinesPerChunk: watcherForm.maxPatchLinesPerChunk
+  };
+}
+
+async function loadWatchers() {
+  watcherError.value = "";
+  loadingWatchers.value = true;
+  try {
+    const response = await fetch("/api/watchers");
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取监控状态失败");
+    }
+    watchers.value = payload.watchers || [];
+  } catch (error) {
+    watcherError.value = error.message;
+  } finally {
+    loadingWatchers.value = false;
+  }
+}
+
+async function createWatcher() {
+  if (creatingWatcher.value) {
+    return;
+  }
+  if (!explorer.owner.trim() || !explorer.repo.trim()) {
+    watcherError.value = "请输入 owner 和 repo";
+    return;
+  }
+  watcherError.value = "";
+  creatingWatcher.value = true;
+  try {
+    const response = await fetch("/api/watchers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(watcherPayload())
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "创建监控失败");
+    }
+    await loadWatchers();
+  } catch (error) {
+    watcherError.value = error.message;
+  } finally {
+    creatingWatcher.value = false;
+  }
+}
+
+async function watcherAction(watcher, action) {
+  watcherError.value = "";
+  try {
+    const response = await fetch(`/api/watchers/${encodeURIComponent(watcher.id)}/${action}`, {
+      method: "POST"
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "监控操作失败");
+    }
+    await loadWatchers();
+    loadHistory();
+  } catch (error) {
+    watcherError.value = error.message;
+  }
+}
+
+async function deleteWatcher(watcher) {
+  if (!window.confirm(`删除监控 ${watcher.request.owner}/${watcher.request.repo}？`)) {
+    return;
+  }
+  watcherError.value = "";
+  try {
+    const response = await fetch(`/api/watchers/${encodeURIComponent(watcher.id)}`, {
+      method: "DELETE"
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "删除监控失败");
+    }
+    await loadWatchers();
+  } catch (error) {
+    watcherError.value = error.message;
+  }
+}
+
+async function openWatcherReport(review) {
+  if (!review.jobId) {
+    return;
+  }
+  watcherError.value = "";
+  try {
+    const response = await fetch(`/api/reviews/${review.jobId}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "读取监控报告失败");
+    }
+    reportCollection.value = { title: "", jobs: [] };
+    job.value = payload;
+    activeView.value = "report";
+  } catch (error) {
+    watcherError.value = error.message;
+  }
+}
+
+function startWatcherPolling() {
+  window.clearInterval(watcherPollingTimer.value);
+  loadWatchers();
+  watcherPollingTimer.value = window.setInterval(loadWatchers, 3000);
 }
 
 async function loadHistory() {
@@ -689,6 +866,7 @@ async function viewHistoryJob(historyJob) {
     if (!response.ok) {
       throw new Error(payload.error || "读取历史报告失败");
     }
+    reportCollection.value = { title: "", jobs: [] };
     job.value = payload;
     activeView.value = "report";
   } catch (error) {
@@ -697,12 +875,16 @@ async function viewHistoryJob(historyJob) {
 }
 
 function rerunHistoryJob(historyJob) {
+  reportCollection.value = { title: "", jobs: [] };
   applyRequest(historyJob.request);
   activeView.value = "review";
 }
 
 function navigate(view) {
   activeView.value = view;
+  if (view !== "watch") {
+    window.clearInterval(watcherPollingTimer.value);
+  }
   if (view === "history") {
     loadHistory();
   }
@@ -714,6 +896,9 @@ function navigate(view) {
   }
   if (view === "batch" && !pulls.value.length && explorer.repo) {
     loadPullRequests();
+  }
+  if (view === "watch") {
+    startWatcherPolling();
   }
 }
 
@@ -741,15 +926,17 @@ function pollJob(jobId) {
 onBeforeUnmount(() => {
   window.clearInterval(pollingTimer.value);
   window.clearInterval(batchPollingTimer.value);
+  window.clearInterval(watcherPollingTimer.value);
 });
 </script>
 
 <template>
   <AppShell
     :active-view="activeView"
-    :is-running="isRunning || isBatchRunning"
+    :is-running="isRunning || isBatchRunning || isWatcherRunning"
     :nav-items="navItems"
     :selected-pr-label="selectedPrLabel"
+    :show-pr-context="showPrContext"
     @navigate="navigate"
     @open-command="showCommand = true"
   >
@@ -765,10 +952,15 @@ onBeforeUnmount(() => {
       :repos="repos"
       :selected-pull="selectedPull"
       :selected-repo="selectedRepo"
+      :selected-urls="selectedBatchPullUrls"
       @apply-selected-pull="applySelectedPull"
+      @clear-selection="clearBatchSelection"
       @load-pulls="loadPullRequests"
       @load-repositories="loadRepositories"
+      @proceed-batch="proceedToBatch"
       @proceed-review="proceedToReview"
+      @select-all="selectAllBatchPulls"
+      @toggle-pull="toggleBatchPull"
     />
 
     <ReviewRunner
@@ -797,18 +989,41 @@ onBeforeUnmount(() => {
       :selected-urls="selectedBatchPullUrls"
       @clear-selection="clearBatchSelection"
       @go-browse="activeView = 'browse'"
+      @open-batch-reports="openBatchReports"
       @open-report="openBatchReport"
       @run="runBatchReview"
       @select-all="selectAllBatchPulls"
       @toggle-pull="toggleBatchPull"
     />
 
+    <WatcherPanel
+      v-else-if="activeView === 'watch'"
+      :creating="creatingWatcher"
+      :error="watcherError"
+      :explorer="explorer"
+      :form="watcherForm"
+      :loading="loadingWatchers"
+      :watchers="watchers"
+      @check="watcherAction($event, 'check')"
+      @create="createWatcher"
+      @delete="deleteWatcher"
+      @go-browse="activeView = 'browse'"
+      @open-report="openWatcherReport"
+      @pause="watcherAction($event, 'pause')"
+      @refresh="loadWatchers"
+      @start="watcherAction($event, 'start')"
+    />
+
     <ReportViewer
       v-else-if="activeView === 'report'"
       :job="job"
       :output-text="outputText"
+      :related-reports="reportCollection.jobs"
+      :report-collection-title="reportCollection.title"
       :run-error="runError"
+      @go-batch="activeView = 'batch'"
       @go-runner="activeView = 'review'"
+      @select-report="selectReportFromCollection"
     />
 
     <HistoryPanel

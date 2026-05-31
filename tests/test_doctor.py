@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from ai_pr_review import doctor as doctor_module
 from ai_pr_review.config import ReviewConfig
 from ai_pr_review.doctor import DoctorReport, render_doctor_json, render_doctor_markdown, run_doctor
+from ai_pr_review.llm import LLMCallResult
 
 
 def test_run_doctor_skips_smoke_without_api_key() -> None:
@@ -80,6 +82,27 @@ def test_run_doctor_allows_non_v1_base_url_when_smoke_succeeds() -> None:
     assert report.ok is True
     assert report.openai_base_url_status == "configured_maybe_web_root"
     assert any("OPENAI_BASE_URL" in item for item in report.warnings)
+
+
+def test_smoke_test_accepts_parseable_json_with_unexpected_content(monkeypatch) -> None:
+    monkeypatch.setattr(doctor_module, "_create_client", lambda **_: object())
+    monkeypatch.setattr(
+        doctor_module,
+        "_call_structured",
+        lambda *_, **__: LLMCallResult(payload={"findings": []}, limitations=[]),
+    )
+
+    ok, error, limitations = doctor_module._smoke_test_llm(
+        model="compatible-model",
+        api_key="sk_secret",
+        base_url="https://one-api.example.com/v1",
+        api_mode="chat",
+        timeout_seconds=30,
+    )
+
+    assert ok is True
+    assert error is None
+    assert limitations == ["LLM smoke test 已连通并返回可解析 JSON，但内容不完全符合预期"]
 
 
 def test_render_doctor_json_is_machine_readable() -> None:
